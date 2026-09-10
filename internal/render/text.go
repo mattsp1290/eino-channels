@@ -119,6 +119,10 @@ func Chunk(text string, budget int, measure Measure) []string {
 				openFence = ""
 			case measure(line) <= maxFence:
 				openFence = strings.TrimRight(line, "\n")
+			default:
+				// An overlong opener still opens a block; chunks reopen it
+				// with a plain fence so the line is never repeated.
+				openFence = "```"
 			}
 		}
 	}

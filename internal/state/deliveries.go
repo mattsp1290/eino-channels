@@ -30,6 +30,11 @@ func newNonce() string {
 // work": every scan, count and lane query must use it so they cannot drift.
 const unresolvedDelivery = `NOT (status = 'acked' AND acked_revision = desired_revision)`
 
+// schedulableDelivery narrows unresolvedDelivery to rows automation can
+// still advance; failed and ambiguous rows wait for operator resolution and
+// must not re-run their route on every scan.
+const schedulableDelivery = `status = 'pending'`
+
 const deliveryColumns = `d.id, d.route_key, d.generation, d.inbox_id, d.run_id, d.delivery_seq, d.chunk_index, d.platform, d.installation, d.channel, d.thread_root, c.dm_actor, d.remote_id, d.nonce, d.desired_revision, d.acked_revision, d.desired_text, d.content_hash, d.status, d.op_state, d.attempts, d.first_attempt_at, d.retry_at, d.audit, d.created_at, d.updated_at`
 
 func scanDelivery(row interface{ Scan(...any) error }) (Delivery, error) {

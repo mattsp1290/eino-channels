@@ -59,8 +59,8 @@ func (s *Store) Ingest(ctx context.Context, in Inbound, cap Capacity) (Dispositi
 		existing, err := scanItem(tx.QueryRowContext(ctx, `SELECT `+itemColumns+` FROM inbox WHERE dedup_key = ?`, dedup))
 		if err == nil {
 			d = Disposition{Outcome: OutcomeDuplicate, Item: existing}
-			d.Conversation, _ = getConversationTx(ctx, tx, existing.RouteKey)
-			return nil
+			d.Conversation, err = getConversationTx(ctx, tx, existing.RouteKey)
+			return err
 		}
 		if !errors.Is(err, ErrNotFound) {
 			return err
@@ -192,7 +192,7 @@ func (s *Store) NextWork(ctx context.Context, routeKey string) (Item, error) {
 func (s *Store) RoutesWithWork(ctx context.Context, after string, limit int) ([]string, error) {
 	rows, err := s.host.QueryContext(ctx, `SELECT route_key FROM (
 		SELECT route_key FROM inbox WHERE state IN (?, ?, ?, ?)
-		UNION SELECT route_key FROM deliveries WHERE `+unresolvedDelivery+`
+		UNION SELECT route_key FROM deliveries WHERE `+schedulableDelivery+`
 	) WHERE route_key > ? ORDER BY route_key LIMIT ?`, StateQueued, StateAdmitting, StateAdmitted, StatePending, after, limit)
 	if err != nil {
 		return nil, storageErr(err)

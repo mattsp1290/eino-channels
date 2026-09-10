@@ -256,8 +256,9 @@ func (s *Service) Ingest(ctx context.Context, in state.Inbound) (Response, error
 	case state.KindStop:
 		if d.StopNoop {
 			resp.Notice = NoticeNothingToDo
+		} else {
+			s.interruptRoute(in.Route.Key(), d.Item.StopTargetRunID)
 		}
-		s.interruptRoute(in.Route.Key(), d.Item.StopTargetRunID)
 	case state.KindPrompt:
 		if in.FilesNotice {
 			resp.Notice = NoticeFiles
@@ -341,6 +342,9 @@ func (s *Service) noticeLoop() {
 			}
 			ctx, cancel := context.WithTimeout(s.ctx, s.platformTimeout())
 			if allowed, err := d.Allowed(ctx, n.dest); err != nil || !allowed {
+				if err != nil {
+					s.log.Warn("notice dropped: destination check failed", "platform", n.dest.Platform, "error", safeErr(err))
+				}
 				cancel()
 				continue
 			}
@@ -446,7 +450,11 @@ func safeErr(err error) string {
 	}
 	msg := err.Error()
 	if len(msg) > 200 {
-		msg = msg[:200]
+		cut := 200
+		for cut > 0 && !utf8.RuneStart(msg[cut]) {
+			cut--
+		}
+		msg = msg[:cut]
 	}
 	return msg
 }

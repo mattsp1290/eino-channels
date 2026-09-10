@@ -94,16 +94,18 @@ func (s *Service) createDelivery(ctx context.Context, d Deliverer, row state.Del
 		s.reconcile(ctx, d, row)
 		return false, true
 	}
+	if !row.HasDesiredText {
+		s.recordf(s.st.MarkEdited(ctx, row.ID, row.DesiredRevision), "acknowledge empty payload", row.ID)
+		return false, true
+	}
+	// Wait for the rate-limit slot before recording the intent: an intent
+	// with no recorded outcome is treated as a possible send.
+	if err := s.throttle(ctx, row.Destination); err != nil {
+		return false, false
+	}
 	intent, err := s.st.MarkCreateIntent(ctx, row.ID)
 	if err != nil {
 		s.recordf(err, "mark create intent", row.ID)
-		return false, false
-	}
-	if !intent.HasDesiredText {
-		s.recordf(s.st.MarkEdited(ctx, intent.ID, intent.DesiredRevision), "acknowledge empty payload", row.ID)
-		return false, true
-	}
-	if err := s.throttle(ctx, intent.Destination); err != nil {
 		return false, false
 	}
 	cctx, cancel := context.WithTimeout(ctx, s.platformTimeout())

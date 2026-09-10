@@ -23,6 +23,9 @@ func (s *Service) scheduler() {
 		case <-s.ctx.Done():
 			return
 		case <-s.wake:
+			// A wake follows an ingest or a finished runner: scan from the
+			// start so the route that just changed is not behind the cursor.
+			s.cursor = ""
 		case <-ticker.C:
 		}
 		s.mu.Lock()
@@ -40,15 +43,19 @@ func (s *Service) scheduler() {
 			s.log.Warn("scheduler scan failed", "error", safeErr(err))
 			continue
 		}
-		if len(keys) != 0 {
-			s.cursor = keys[len(keys)-1]
-		}
 		now := time.Now()
+		full := false
 		for _, key := range keys {
 			s.mu.Lock()
+			if len(s.active) >= s.limits.MaxRunningConversations {
+				s.mu.Unlock()
+				full = true
+				break // the cursor stays before this key so it is attempted next
+			}
+			s.cursor = key
 			_, running := s.active[key]
 			until, parked := s.parked[key]
-			if running || parked && now.Before(until) || len(s.active) >= s.limits.MaxRunningConversations {
+			if running || parked && now.Before(until) {
 				s.mu.Unlock()
 				continue
 			}
@@ -57,6 +64,9 @@ func (s *Service) scheduler() {
 			s.mu.Unlock()
 			s.runners.Add(1)
 			go s.runRoute(key)
+		}
+		if !full && len(keys) < routeBatch {
+			s.cursor = "" // the batch was exhausted; next scan starts over
 		}
 	}
 }

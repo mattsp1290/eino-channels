@@ -339,6 +339,12 @@ func TestChunkOverlongFenceLineDoesNotAmplify(t *testing.T) {
 	if total > 2*len(text) {
 		t.Fatalf("output %d bytes for %d input bytes", total, len(text))
 	}
+	// Text after the closing fence must not be rendered inside a code block.
+	after := Chunk(text+strings.Repeat("prose line\n", 300), budget, DiscordMeasure)
+	last := after[len(after)-1]
+	if strings.HasPrefix(last, "```") || strings.Count(last, "```")%2 != 0 {
+		t.Fatalf("fence state inverted after overlong opener: %q", last[:min(len(last), 80)])
+	}
 	// Ordinary fences still balance and reopen, with a floor on the budget.
 	normal := "```go\n" + strings.Repeat("fmt.Println(1)\n", 300) + "```\n"
 	for _, c := range Chunk(normal, 200, SlackMeasure) {

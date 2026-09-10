@@ -1,0 +1,4 @@
+interface:
+  display_name: "Next Eino Channels Milestone"
+  short_description: "Choose the next shared-conversation agent milestone"
+  default_prompt: "Use $implementation-plan $next-milestone to research and plan the next eino-channels milestone against OpenTag, Claude Tag, and Codex in Slack."

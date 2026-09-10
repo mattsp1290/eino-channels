@@ -1,0 +1,42 @@
+# WP5 — integration, operations and release evidence
+
+Prerequisites: WP1–WP4 complete. New/proposed test files under WP1 `internal/integration/`: `conversation_test.go`, `restart_test.go`, `isolation_test.go`, `delivery_test.go`, `limits_test.go`. New `docs/manual-smoke.md`; complete WP1 `docs/operations.md`, Makefile/CI, setup docs and existing README.md. New/proposed `internal/app/delivery.go` extends WP1 command dispatch with operator resolution below.
+
+## Credential-free gate
+
+`make check` must run gofmt cleanliness, `go mod tidy -diff`, `go mod verify`, no Replace modules, `go vet ./...`, `go test ./...`, `go test -race ./...`, and `go build ./cmd/eino-channels`. Set GOWORK=off in CI. Tests never read default operator state/config or real credential environment; fake tokens are explicit. Both SDK adapters must exercise actual outgoing HTTP options through fake transports, beyond mocks of the local Delivery interface.
+
+Use actual published eino-agent + SQLite + empty registry + watch + eino-providers/opencodego + local HTTP fixtures. Gates:
+
+1. First user+assistant exchange, second prompt observes exactly one previous pair, process teardown/reopen and third prompt observes both pairs. Real wire model is deepseek-v4-flash, path `/zen/go/v1/chat/completions`, truthful User-Agent, stable nonempty x-opencode-session, no tools/tool_choice payload and no secret in stored configuration. Test distinct parallel Slack and Discord sessions, and same-platform different tenants/channels/threads/users.
+2. Commit durable inbox, kill before admission; kill after agent commit before host saves receipt; kill after model terminal before delivery save. Reopen the same files in a separate process. Duplicate input always resolves the same run. At most one initial provider dispatch for each admitted event; terminal model output is never generated again for outbound retry. Contrast a truly new identical text message with a new platform ID, which must be admitted as a new turn.
+3. Interrupt a blocked stream, preserve admitted user text and committed partial answer, omit empty placeholder, then allow next prompt. Kill a streaming process, wait lease expiry, recover as interrupted with zero replayed inference. Shutdown/detach/socket loss have distinct documented outcomes.
+4. Slow and overflowed watch consumers, output cap, max history, full per-route/global queues, stalled Web API, concurrent stop/new, failed SQL commit, unknown schema and second daemon startup all terminate/bound work as specified. Test max supported history can still be projected and delivered without observation overflow.
+5. Platform fake tests verify early Slack ack, dedup envelopes, Discord thread binding, mention filtering, rate-limited coalescing, Unicode-safe chunks, final delivery from committed state, ambiguous send reconciliation and permanent send failure. Prompt secrets and native error-body sentinels do not appear in application diagnostics/logs; intentional user/assistant content is still displayed only in its authorized destination.
+6. Auth/quota/429/timeout/HTTP 200 truncated SSE and unsupported tool-call output settle failed/interrupted without model fallback. Inspect request count to identify SDK retries rather than assuming WithAttempts(1) controls every layer. If the selected Chat path retries charged/ambiguous inference, resolve it in provider before release and record the narrow request. Provider model rejection remains explicit, no guessed model alias.
+
+## TUI quality mapping
+
+| TUI behavior / source | Channel acceptance |
+| --- | --- |
+| internal/runtimeui/service.go durable current-message submission | Multi-turn/reopen tests above prove exact history, no double write |
+| internal/runtimeui/pump.go live and terminal snapshots | Slow-stream fixture shows preview before EOF and exact durable final after EOF |
+| README.md interrupt/recovery and safe diagnostics | stop, forced restart, lease recovery and sentinel tests |
+| internal/integration and Makefile independent module graph | real published-runtime/provider/SDK integration and make check |
+| Workspace isolation | platform tenant/channel/thread/DM isolation and stable provider session IDs |
+
+TUI tools, Codex login/model picker, terminal rendering, repository access and provider reasoning UI are excluded by the initial version's scope. “Same quality” is a conversation/lifecycle bar, not a requirement to reproduce those features.
+
+## Operator delivery recovery
+
+Implement proposed CLI `eino-channels delivery list --config <path>` with bounded rows of delivery ID, platform and safe status only. `delivery resolve --id <id> --action associate-message --message-id <id> --config <path>` associates an operator-verified existing bot message after verifying the stored destination and platform-specific remote evidence. Discord verifies author and destination through its API. Slack has no shared-channel history scope in this plan: require the operator to attest they inspected the original destination and that the supplied timestamp identifies the intended bot message, using an explicit `--confirm-inspected` flag; record this as operator-attested rather than API-verified. Never call Slack history APIs with ungranted scopes; `--action resend` moves ambiguous/failed delivery back to pending with an audit marker and clearly documented possible duplicate external message. Both require daemon stopped and exclusive state lock, never expose prompt/answer/token bodies, and never call the model. Resend schedules delivery for next serve startup. Associate-message persists the recovered remote ID and schedules an edit to the latest committed final revision; it never marks the answer delivered or clears pending final text. If inference is still running, retain the preview association and await its terminal desired revision. Only an acknowledged final-content edit/create clears payload and advances delivery order. Resolve cannot alter conversation/run/destination. Test ambiguous “Thinking…” create → model completes → associate-message → restart → successful final edit, proving the final answer survives and successors remain blocked until it is acknowledged. Also test malformed ID, wrong Discord owner/destination, missing Slack attestation, concurrent daemon, repeated resolution, and read-only listing. The command performs no unsolicited sends during planning.
+
+## Live release gate
+
+Operator-managed test bot installations and OpenCode credentials are prerequisites to these tests, not planning inputs. Use disposable permitted DM/channel/thread locations and minimal nonsensitive prompts. No publishing/installations/messaging occurred during planning. During implementation, get explicit user authorization before sending live bot messages to other people; prefer the operator's own test destinations.
+
+For each platform: start service, ask for a short answer with a nonce, ask a follow-up referring to it, restart and ask another reference question; verify an edit/preview is visible during a deliberately long response; interrupt then continue; send a long Unicode/code-fence answer; verify channel threads and DM isolation. Exercise !help/!new and denied actor. With both adapters enabled, one platform disconnect must not stop the other. Verify effective permissions/intents and no mention notifications. Verify actual Flash service accepts no-tools multi-turn history across process restart; fixtures cannot establish live model behavior or account eligibility.
+
+Record only version pins, OS/Go version, public model/protocol, date, and per-case pass/fail in docs/manual-smoke.md. Do not record tokens, account IDs, private channel IDs, prompt/answer bodies, raw errors or screenshots. Failure of live eligibility/model/protocol gate blocks release and identifies provider owner; it does not authorize fallback to DeepSeek direct, Zen paid routing or another model.
+
+Rollout: one test installation first, back up both closed databases, run check-config, then serve with restrictive allowlists. No feature flags. Rollback: stop process, retain files, restore prior binary and matching two-database backup only under operator direction; never run an old binary on unsupported schemas or auto-delete data. Restore can erase recent dedup receipts and risk replay, so keep installation disconnected until operator confirms recovery boundary. This is a new app, so no legacy data migration is promised.

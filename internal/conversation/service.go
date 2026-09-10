@@ -143,6 +143,7 @@ type Service struct {
 	handles   map[string]runtime.Handle
 	stopFlags map[string]bool   // keyed by run ID
 	ingests   map[string]uint64 // per-route ingest counter; parking is conditional on it
+	rescan    bool              // set by ingest: next scheduler scan starts from the first route
 	notices   chan notice
 
 	limiterMu   sync.Mutex

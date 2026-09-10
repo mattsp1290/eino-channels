@@ -339,6 +339,15 @@ func TestChunkOverlongFenceLineDoesNotAmplify(t *testing.T) {
 	if total > 2*len(text) {
 		t.Fatalf("output %d bytes for %d input bytes", total, len(text))
 	}
+	// Openers near the budget never push a chunk over it.
+	for _, n := range []int{1780, 1790, 1795, 1797, 1798, 1799, 1800, 1801} {
+		edge := "```" + strings.Repeat("y", n-3) + "\n" + strings.Repeat("z\n", 50) + "```\n"
+		for _, c := range Chunk(edge, budget, DiscordMeasure) {
+			if DiscordMeasure(c) > budget {
+				t.Fatalf("opener of %d units produced a chunk of %d units", n, DiscordMeasure(c))
+			}
+		}
+	}
 	// Text after the closing fence must not be rendered inside a code block.
 	after := Chunk(text+strings.Repeat("prose line\n", 300), budget, DiscordMeasure)
 	last := after[len(after)-1]

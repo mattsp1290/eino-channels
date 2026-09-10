@@ -94,7 +94,9 @@ func Chunk(text string, budget int, measure Measure) []string {
 			continue
 		}
 		limit := budget
-		if openFence != "" || isFence(line) && measure(line) <= maxFence {
+		if openFence != "" || isFence(line) {
+			// Every fence line reserves room for the balancing markers, an
+			// overlong opener included: it still opens a block.
 			limit = max(budget-fenceReserve-measure(openFence), budget/2)
 		}
 		ll := measure(line)

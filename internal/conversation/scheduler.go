@@ -9,7 +9,7 @@ import (
 const (
 	scheduleTick    = time.Second
 	routeBatch      = 64
-	parkBlocked     = 30 * time.Second
+	parkBlocked     = 10 * time.Minute // operator resolution restarts the service anyway
 	parkUnavailable = 15 * time.Second
 )
 
@@ -23,11 +23,16 @@ func (s *Service) scheduler() {
 		case <-s.ctx.Done():
 			return
 		case <-s.wake:
-			// A wake follows an ingest or a finished runner: scan from the
-			// start so the route that just changed is not behind the cursor.
-			s.cursor = ""
 		case <-ticker.C:
 		}
+		// An ingest scans from the start so the changed route is not behind
+		// the cursor; runner completions keep the rotation.
+		s.mu.Lock()
+		if s.rescan {
+			s.rescan = false
+			s.cursor = ""
+		}
+		s.mu.Unlock()
 		s.mu.Lock()
 		closing := s.closing
 		s.mu.Unlock()
@@ -89,6 +94,7 @@ func (s *Service) unpark(key string) {
 	s.mu.Lock()
 	delete(s.parked, key)
 	s.ingests[key]++
+	s.rescan = true
 	s.mu.Unlock()
 }
 

@@ -10,6 +10,9 @@ Implementation notes that differ from or refine the plan text:
 - Discord 502 on create is classified ambiguous (DiscordGo returns a plain error, not a RESTError, when its retries are disabled).
 - Delivery spacing/preview coalescing is a service option (default 1.2 s) so fixtures can shorten it.
 - Notices (help, denied, capacity, stopped) are transient best-effort sends through a bounded queue, not durable deliveries.
+- Adapters ship as one `adapter.go` per platform (plus `render.go` for Slack) rather than the `{adapter,events,delivery,threads}.go` split proposed in 03/04.
+- `internal/integration/isolation_test.go` does not exist; isolation coverage lives in `conversation_test.go` (`TestRealProviderTwoTurnsReopenAndIsolation`).
+- The Slack persist-before-ack deadline defaults to 1 s (the plan's target), configurable through the adapter options.
 - eino-providers has a newer pseudo-version (c81e1b0110d7) on the proxy; the module pins the WP0-verified fb8ed3137d58 and `make check-mod` enforces it.
 
 ## Ordered packages

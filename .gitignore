@@ -31,6 +31,11 @@ go.work.sum
 # .idea/
 # .vscode/
 
+# OS and local tool state
+.DS_Store
+.slack/
+.envrc
+
 # eino-channels local state and binaries
 /eino-channels
 /state/

@@ -3,6 +3,7 @@
 ## Requirements
 
 - Go 1.26.8 (the module pins the toolchain; `GOTOOLCHAIN=auto` downloads it).
+- Linux or macOS: the state directory lock uses `flock(2)`.
 - An OpenCode Go API key eligible for `deepseek-v4-flash` over Chat
   Completions. The service identifies itself truthfully as
   `eino-channels/<version>`; check that the service terms fit your deployment.
@@ -29,7 +30,7 @@ Copy `config.example.json` and edit:
 | `discord.enabled`, `discord.guild_ids` | Enable Discord for the listed guilds. |
 | `discord.allowed_channel_ids` | Text channels where mentions are accepted (threads inherit from their parent). |
 | `discord.allowed_user_ids` | Users allowed to talk to the bot, including in DMs. Required when enabled. |
-| `limits.*` | Optional overrides; each must be positive and at or below its ceiling. |
+| `limits.*` | Optional overrides; each must be positive and at or below its ceiling. An absent or zero value selects the default. |
 
 At least one platform must be enabled. The provider (`opencode-go`), model
 (`deepseek-v4-flash`) and protocol (Chat Completions) are fixed constants.

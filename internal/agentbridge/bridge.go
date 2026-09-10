@@ -69,9 +69,11 @@ type Bridge struct {
 // are sized to contain the maximum supported generation (100 turns).
 func WatchOptions() watch.Options {
 	return watch.Options{
-		Snapshot:           ObservationLimits(),
-		PollInterval:       50 * time.Millisecond,
-		ReadTimeout:        time.Second,
+		Snapshot: ObservationLimits(),
+		// Both databases run on single-connection pools, so polls compete
+		// with orchestrator writes; a read timeout kills the subscription.
+		PollInterval:       100 * time.Millisecond,
+		ReadTimeout:        5 * time.Second,
 		MaxSubscriptions:   64,
 		MaxWatchedSessions: 32,
 		MaxLiveRuns:        32,
@@ -173,7 +175,9 @@ func (b *Bridge) Submit(ctx context.Context, turn Turn) (runtime.AdmissionResult
 }
 
 // Lookup resolves a committed receipt through the root store, outside any
-// transaction and without constructing execution.
+// transaction and without constructing execution. Unlike runtime.Start it
+// does not compare the fingerprint version: a receipt from an older
+// fingerprint version is still adopted because that run really happened.
 func (b *Bridge) Lookup(ctx context.Context, sessionID session.ID, key string) (session.AdmissionRecord, error) {
 	return b.store.LookupAdmission(ctx, sessionID, key)
 }

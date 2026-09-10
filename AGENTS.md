@@ -54,8 +54,10 @@ talk to the service through `state.Inbound` and `conversation.Deliverer`.
   twice for a row. Ambiguous and failed rows block their route's lane until
   an operator resolves them; the model answer is never regenerated for a send.
 - Final text comes only from the committed transcript. Previews are transient.
-- The single `unresolvedDelivery`/`schedulableDelivery` predicates in
-  `internal/state/deliveries.go` are the only definitions of "needs work".
+- The `unresolvedDelivery`/`schedulableDelivery` predicates in
+  `internal/state/deliveries.go` define "needs work" for every query;
+  `Delivery.Resolved()` mirrors them for callers and `TestPredicatesAgree`
+  keeps the three in step.
 - Credentials come only from the environment and never reach logs, chat,
   config snapshots, or error text. Tests plant sentinel strings to prove it.
 - Provider and model are constants (`opencode-go`, `deepseek-v4-flash`);

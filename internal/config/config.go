@@ -36,7 +36,8 @@ const (
 
 // Limits are the bounded runtime defaults. Only the exposed fields may be
 // overridden through the configuration file; each override must be positive
-// and at or below its hard ceiling.
+// and at or below its hard ceiling. An absent or explicit zero value selects
+// the default (the fields are omitempty, so the two are indistinguishable).
 type Limits struct {
 	MaxRunningConversations  int `json:"max_running_conversations,omitempty"`
 	MaxQueuedPerConversation int `json:"max_queued_per_conversation,omitempty"`

@@ -181,6 +181,9 @@ func (f *fakeAPI) writeStep(w http.ResponseWriter, kind string) bool {
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = w.Write([]byte("bad gateway SENTINEL_BODY"))
 		return true
+	case "500":
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"message": "server error SENTINEL_BODY", "code": 0})
+		return true
 	case "archived":
 		writeJSON(w, http.StatusBadRequest, map[string]any{"message": "Thread is archived SENTINEL_BODY", "code": 50083})
 		return true
@@ -963,6 +966,41 @@ func TestDiscordDeliveryReconcile(t *testing.T) {
 	gotID, found, err = d.Reconcile(context.Background(), dest, "n-missing")
 	if err != nil || found || gotID != "" {
 		t.Errorf("Reconcile(n-missing) = (%q,%v,%v), want (\"\",false,nil)", gotID, found, err)
+	}
+}
+
+func TestDiscordDeliveryDefinite500(t *testing.T) {
+	h := setup(t, defaultCfg())
+	dest := threadDest(h, "600000000000000041")
+	d := h.a.Deliverer()
+	h.fake.script(http.MethodPost, "/api/v9/channels/"+dest.Channel+"/messages", "500")
+	_, err := d.Create(context.Background(), dest, "hello", "n-500")
+	var de *conversation.DeliveryError
+	if !assertDeliveryError(t, err, &de) {
+		return
+	}
+	if de.Kind != conversation.KindDefinite {
+		t.Errorf("Kind = %v, want KindDefinite for a RESTError 500", de.Kind)
+	}
+	if strings.Contains(err.Error(), "SENTINEL_BODY") {
+		t.Error("error text leaked the response body")
+	}
+}
+
+func TestDiscordReconcileNumericNonce(t *testing.T) {
+	h := setup(t, defaultCfg())
+	dest := threadDest(h, "600000000000000042")
+	d := h.a.Deliverer()
+	// Discord may echo an integer nonce; plant one directly in the fake.
+	h.fake.mu.Lock()
+	h.fake.lists[dest.Channel] = append(h.fake.lists[dest.Channel], map[string]any{
+		"id": "700000000000000042", "channel_id": dest.Channel, "content": "x", "nonce": 123456789,
+		"author": map[string]any{"id": h.a.BotID(), "bot": true},
+	})
+	h.fake.mu.Unlock()
+	id, found, err := d.Reconcile(context.Background(), dest, "123456789")
+	if err != nil || !found || id != "700000000000000042" {
+		t.Fatalf("Reconcile numeric nonce = (%q,%v,%v)", id, found, err)
 	}
 }
 

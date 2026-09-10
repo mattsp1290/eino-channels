@@ -8,6 +8,7 @@ import (
 	"io"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -75,7 +76,9 @@ func deliveryList(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "listing failed:", err.Error())
 		return 1
 	}
-	fmt.Fprintf(stdout, "%-8s %-8s %-18s %-14s %-9s %-6s %-22s %s\n", "ID", "PLATFORM", "STATUS", "OP", "ATTEMPTS", "CHUNK", "CHANNEL", "THREAD")
+	// THREAD/GUILD: a Slack thread timestamp, or the guild ID for Discord
+	// (whose Channel column is the thread channel itself).
+	fmt.Fprintf(stdout, "%-8s %-8s %-18s %-14s %-9s %-6s %-22s %s\n", "ID", "PLATFORM", "STATUS", "OP", "ATTEMPTS", "CHUNK", "CHANNEL", "THREAD/GUILD")
 	for _, d := range rows {
 		fmt.Fprintf(stdout, "%-8d %-8s %-18s %-14s %-9d %-6d %-22s %s\n", d.ID, d.Destination.Platform, d.Status, d.Op, d.Attempts, d.ChunkIndex, d.Destination.Channel, d.Destination.ThreadRoot)
 	}
@@ -174,15 +177,16 @@ func deliveryResolve(args []string, stdout, stderr io.Writer, getenv func(string
 				fmt.Fprintln(stderr, "--message-id must be a Discord message ID")
 				return 2
 			}
-			secrets, err := config.LoadSecrets(cfg, getenv)
-			if err != nil {
-				fmt.Fprintln(stderr, err.Error())
+			// Only the Discord token is needed for this verification.
+			token := strings.TrimSpace(getenv(config.EnvDiscordBotToken))
+			if token == "" {
+				fmt.Fprintf(stderr, "%s is required to verify a Discord message\n", config.EnvDiscordBotToken)
 				return 2
 			}
 			if verifier == nil {
 				verifier = discordVerifier{}
 			}
-			if err := verifier.VerifyDiscord(ctx, secrets.DiscordBotToken, d.Destination.Channel, *messageID); err != nil {
+			if err := verifier.VerifyDiscord(ctx, token, d.Destination.Channel, *messageID); err != nil {
 				fmt.Fprintln(stderr, "verification failed:", err.Error())
 				return 1
 			}

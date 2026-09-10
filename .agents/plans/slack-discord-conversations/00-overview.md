@@ -1,6 +1,6 @@
 # Slack and Discord conversations
 
-Status: Implemented on branch `conversations` (2026-09-10); credential-free gate passes; live release gate (WP5) pending operator credentials. See 06 for refinements.
+Status: see [06-execution-handoff.md](06-execution-handoff.md), the status of record; this line is not updated.
 
 ## Application context
 

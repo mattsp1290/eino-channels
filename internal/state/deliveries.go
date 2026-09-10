@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -28,14 +27,21 @@ func newNonce() string {
 
 // unresolvedDelivery is the single definition of "this row still needs
 // work": every scan, count and lane query must use it so they cannot drift.
-const unresolvedDelivery = `NOT (status = 'acked' AND acked_revision = desired_revision)`
+// unresolvedDeliveryD is the same predicate qualified with the `d` alias for
+// joined queries; TestPredicatesAgree keeps the two in step.
+const (
+	unresolvedDelivery  = `NOT (status = 'acked' AND acked_revision = desired_revision)`
+	unresolvedDeliveryD = `NOT (d.status = 'acked' AND d.acked_revision = d.desired_revision)`
+)
 
 // schedulableDelivery narrows unresolvedDelivery to rows automation can
 // still advance; failed and ambiguous rows wait for operator resolution and
 // must not re-run their route on every scan.
 const schedulableDelivery = `status = 'pending'`
 
-const deliveryColumns = `d.id, d.route_key, d.generation, d.inbox_id, d.run_id, d.delivery_seq, d.chunk_index, d.platform, d.installation, d.channel, d.thread_root, c.dm_actor, d.remote_id, d.nonce, d.desired_revision, d.acked_revision, d.desired_text, d.content_hash, d.status, d.op_state, d.attempts, d.first_attempt_at, d.retry_at, d.audit, d.created_at, d.updated_at`
+// Delivery reads LEFT JOIN conversations for dm_actor so an orphaned row can
+// never silently vanish from the lane.
+const deliveryColumns = `d.id, d.route_key, d.generation, d.inbox_id, d.run_id, d.delivery_seq, d.chunk_index, d.platform, d.installation, d.channel, d.thread_root, COALESCE(c.dm_actor, ''), d.remote_id, d.nonce, d.desired_revision, d.acked_revision, d.desired_text, d.content_hash, d.status, d.op_state, d.attempts, d.first_attempt_at, d.retry_at, d.audit, d.created_at, d.updated_at`
 
 func scanDelivery(row interface{ Scan(...any) error }) (Delivery, error) {
 	var d Delivery
@@ -108,7 +114,7 @@ func (s *Store) PlanPreview(ctx context.Context, item Item, placeholder string) 
 			return err
 		}
 		var err error
-		out, err = scanDelivery(tx.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d JOIN conversations c ON c.route_key = d.route_key WHERE d.run_id = ? AND d.chunk_index = 0`, item.RunID))
+		out, err = scanDelivery(tx.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d LEFT JOIN conversations c ON c.route_key = d.route_key WHERE d.run_id = ? AND d.chunk_index = 0`, item.RunID))
 		return err
 	})
 	return out, err
@@ -117,7 +123,7 @@ func (s *Store) PlanPreview(ctx context.Context, item Item, placeholder string) 
 // NextDelivery returns the lowest-ordered unresolved delivery of the route
 // and whether the lane is blocked by a failed or ambiguous predecessor.
 func (s *Store) NextDelivery(ctx context.Context, routeKey string) (Delivery, bool, error) {
-	d, err := scanDelivery(s.host.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d JOIN conversations c ON c.route_key = d.route_key WHERE d.route_key = ? AND `+qualify(unresolvedDelivery)+` ORDER BY d.delivery_seq, d.chunk_index LIMIT 1`, routeKey))
+	d, err := scanDelivery(s.host.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d LEFT JOIN conversations c ON c.route_key = d.route_key WHERE d.route_key = ? AND `+unresolvedDeliveryD+` ORDER BY d.delivery_seq, d.chunk_index LIMIT 1`, routeKey))
 	if err != nil {
 		return Delivery{}, false, err
 	}
@@ -127,12 +133,12 @@ func (s *Store) NextDelivery(ctx context.Context, routeKey string) (Delivery, bo
 
 // GetDelivery loads one row.
 func (s *Store) GetDelivery(ctx context.Context, id int64) (Delivery, error) {
-	return scanDelivery(s.host.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d JOIN conversations c ON c.route_key = d.route_key WHERE d.id = ?`, id))
+	return scanDelivery(s.host.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d LEFT JOIN conversations c ON c.route_key = d.route_key WHERE d.id = ?`, id))
 }
 
 // DeliveryForRun loads the chunk row of a run.
 func (s *Store) DeliveryForRun(ctx context.Context, runID string, chunk int) (Delivery, error) {
-	return scanDelivery(s.host.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d JOIN conversations c ON c.route_key = d.route_key WHERE d.run_id = ? AND d.chunk_index = ?`, runID, chunk))
+	return scanDelivery(s.host.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d LEFT JOIN conversations c ON c.route_key = d.route_key WHERE d.run_id = ? AND d.chunk_index = ?`, runID, chunk))
 }
 
 // MarkCreateIntent persists the intent (and nonce) before a create call.
@@ -149,7 +155,7 @@ func (s *Store) MarkCreateIntent(ctx context.Context, id int64) (Delivery, error
 		if n, _ := res.RowsAffected(); n != 1 {
 			return fmt.Errorf("%w: delivery %d already has a remote message", ErrConflict, id)
 		}
-		out, err = scanDelivery(tx.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d JOIN conversations c ON c.route_key = d.route_key WHERE d.id = ?`, id))
+		out, err = scanDelivery(tx.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d LEFT JOIN conversations c ON c.route_key = d.route_key WHERE d.id = ?`, id))
 		return err
 	})
 	return out, err
@@ -193,13 +199,22 @@ func (s *Store) markAcked(ctx context.Context, id int64, remoteID string, acked 
 	})
 }
 
-// MarkAttempt records a retry schedule after a definite failure. A row
+// MarkAttempt records a failed attempt and its retry schedule. A row
 // without a remote ID returns to the planned operation state so that a
 // create intent left behind by a crash can be told apart from a definite
-// failure.
+// failure. Use it for edits; creates already count their attempt in
+// MarkCreateIntent and use MarkRetryAt.
 func (s *Store) MarkAttempt(ctx context.Context, id int64, retryAt time.Time) error {
 	now := time.Now().UnixNano()
 	_, err := s.host.ExecContext(ctx, `UPDATE deliveries SET attempts = attempts + 1, first_attempt_at = CASE WHEN first_attempt_at = 0 THEN ? ELSE first_attempt_at END, retry_at = ?, op_state = CASE WHEN remote_id = '' THEN ? ELSE op_state END, updated_at = ? WHERE id = ?`, now, retryAt.UnixNano(), OpPlanned, now, id)
+	return storageErr(err)
+}
+
+// MarkRetryAt schedules a retry without counting another attempt; the
+// create intent already counted it.
+func (s *Store) MarkRetryAt(ctx context.Context, id int64, retryAt time.Time) error {
+	now := time.Now().UnixNano()
+	_, err := s.host.ExecContext(ctx, `UPDATE deliveries SET retry_at = ?, op_state = CASE WHEN remote_id = '' THEN ? ELSE op_state END, updated_at = ? WHERE id = ?`, retryAt.UnixNano(), OpPlanned, now, id)
 	return storageErr(err)
 }
 
@@ -217,9 +232,16 @@ func (s *Store) MarkAmbiguous(ctx context.Context, id int64) error {
 }
 
 // MarkFailed records a permanent delivery failure for operator resolution.
+// A row already acknowledged at its desired revision never moves backwards.
 func (s *Store) MarkFailed(ctx context.Context, id int64, audit string) error {
-	_, err := s.host.ExecContext(ctx, `UPDATE deliveries SET status = ?, audit = ?, updated_at = ? WHERE id = ?`, DeliveryFailed, audit, time.Now().UnixNano(), id)
-	return storageErr(err)
+	res, err := s.host.ExecContext(ctx, `UPDATE deliveries SET status = ?, audit = ?, updated_at = ? WHERE id = ? AND `+unresolvedDelivery, DeliveryFailed, audit, time.Now().UnixNano(), id)
+	if err != nil {
+		return storageErr(err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("%w: delivery %d is already resolved", ErrConflict, id)
+	}
+	return nil
 }
 
 // SetDesired updates the desired text/revision of an existing row. It is a
@@ -231,7 +253,7 @@ func (s *Store) SetDesired(ctx context.Context, id int64, text string, revision 
 
 // ListDeliveries returns bounded rows for operator listing.
 func (s *Store) ListDeliveries(ctx context.Context, limit int) ([]Delivery, error) {
-	rows, err := s.host.QueryContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d JOIN conversations c ON c.route_key = d.route_key WHERE `+qualify(unresolvedDelivery)+` ORDER BY d.id LIMIT ?`, limit)
+	rows, err := s.host.QueryContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d LEFT JOIN conversations c ON c.route_key = d.route_key WHERE `+unresolvedDeliveryD+` ORDER BY d.id LIMIT ?`, limit)
 	if err != nil {
 		return nil, storageErr(err)
 	}
@@ -252,7 +274,7 @@ func (s *Store) ListDeliveries(ctx context.Context, limit int) ([]Delivery, erro
 // latest desired revision remains pending as an edit.
 func (s *Store) AssociateMessage(ctx context.Context, id int64, remoteID, audit string) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
-		d, err := scanDelivery(tx.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d JOIN conversations c ON c.route_key = d.route_key WHERE d.id = ?`, id))
+		d, err := scanDelivery(tx.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d LEFT JOIN conversations c ON c.route_key = d.route_key WHERE d.id = ?`, id))
 		if err != nil {
 			return err
 		}
@@ -270,7 +292,7 @@ func (s *Store) AssociateMessage(ctx context.Context, id int64, remoteID, audit 
 // marker. A duplicate external message is possible and documented.
 func (s *Store) Resend(ctx context.Context, id int64, audit string) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
-		d, err := scanDelivery(tx.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d JOIN conversations c ON c.route_key = d.route_key WHERE d.id = ?`, id))
+		d, err := scanDelivery(tx.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d LEFT JOIN conversations c ON c.route_key = d.route_key WHERE d.id = ?`, id))
 		if err != nil {
 			return err
 		}
@@ -293,11 +315,4 @@ func (s *Store) UnresolvedDeliveries(ctx context.Context, routeKey string) (int,
 	var n int
 	err := s.host.QueryRowContext(ctx, `SELECT COUNT(*) FROM deliveries WHERE route_key = ? AND `+unresolvedDelivery, routeKey).Scan(&n)
 	return n, storageErr(err)
-}
-
-// qualify prefixes the unresolved predicate's columns with the deliveries
-// alias used in joined queries.
-func qualify(predicate string) string {
-	r := strings.NewReplacer("status", "d.status", "acked_revision", "d.acked_revision", "desired_revision", "d.desired_revision")
-	return r.Replace(predicate)
 }

@@ -66,6 +66,9 @@ func (s *Service) settleStop(conv state.Conversation, ctl state.Item) workOutcom
 // waits until the run is terminal.
 func (s *Service) settleRun(target state.Item) workOutcome {
 	runID := session.RunID(target.RunID)
+	// The flag must be set even when no handle is owned (after a restart),
+	// so the finalizing turn labels the outcome as a user stop.
+	s.setStopFlag(target.RunID)
 	s.interruptRoute(target.RouteKey, target.RunID)
 	deadline := time.Now().Add(15 * time.Second)
 	for {

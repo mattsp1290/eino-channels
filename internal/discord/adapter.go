@@ -266,10 +266,13 @@ func (a *Adapter) channel(ctx context.Context, id string) (*discordgo.Channel, e
 	}
 	a.mu.Lock()
 	if len(a.cache) >= channelCacheEntries {
-		for k := range a.cache {
-			delete(a.cache, k)
-			break
+		oldestKey, oldest := "", time.Time{}
+		for k, v := range a.cache {
+			if oldestKey == "" || v.fetched.Before(oldest) {
+				oldestKey, oldest = k, v.fetched
+			}
 		}
+		delete(a.cache, oldestKey)
 	}
 	a.cache[id] = cachedChannel{ch: ch, fetched: time.Now()}
 	a.mu.Unlock()
@@ -407,7 +410,13 @@ func (d *Deliverer) Reconcile(ctx context.Context, dest state.Destination, nonce
 // independent of the Gateway. A lookup failure is reported as an error so
 // the caller retries later instead of failing the delivery.
 func (d *Deliverer) Allowed(ctx context.Context, dest state.Destination) (bool, error) {
-	if dest.Platform != state.PlatformDiscord || dest.Installation != d.a.BotID() {
+	bot := d.a.BotID()
+	if bot == "" {
+		// Before the Gateway Ready handshake the installation identity is
+		// unknown: that is "cannot check now", never a denial.
+		return false, errors.New("discord: identity not established yet")
+	}
+	if dest.Platform != state.PlatformDiscord || dest.Installation != bot {
 		return false, nil
 	}
 	if dest.DMActor != "" {

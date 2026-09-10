@@ -99,6 +99,12 @@ func checkConfig(args []string, stdout, stderr io.Writer, getenv func(string) st
 		return 2
 	}
 	fmt.Fprint(stdout, cfg.Redacted())
+	if cfg.Slack.Enabled && len(cfg.Slack.AllowedChannelIDs) == 0 {
+		fmt.Fprintln(stdout, "note: slack.allowed_channel_ids is empty; Slack will answer DMs only")
+	}
+	if cfg.Discord.Enabled && len(cfg.Discord.AllowedChannelIDs) == 0 {
+		fmt.Fprintln(stdout, "note: discord.allowed_channel_ids is empty; Discord will answer DMs only")
+	}
 	fmt.Fprintln(stdout, "credentials: present")
 	fmt.Fprintln(stdout, "ok")
 	return 0
@@ -120,7 +126,7 @@ func serve(args []string, stderr io.Writer, getenv func(string) string, logger *
 	defer stop()
 	code, err := Serve(ctx, cfg, secrets, logger)
 	if err != nil {
-		logger.Error("serve failed", "error", err.Error())
+		logger.Error("serve failed", "error", safeErr(err))
 	}
 	return code
 }
@@ -184,14 +190,14 @@ func Serve(ctx context.Context, cfg config.Config, secrets config.Secrets, logge
 	case err := <-fatal:
 		if err != nil {
 			exitErr = err
-			logger.Error("adapter stopped", "error", err.Error())
+			logger.Error("adapter stopped", "error", safeErr(err))
 			// One platform failing does not stop the other unless it is the only one.
 			if len(deliverers) > 1 {
 				select {
 				case <-ctx.Done():
 				case err2 := <-fatal:
 					if err2 != nil {
-						logger.Error("adapter stopped", "error", err2.Error())
+						logger.Error("adapter stopped", "error", safeErr(err2))
 					}
 				}
 			}
@@ -202,12 +208,22 @@ func Serve(ctx context.Context, cfg config.Config, secrets config.Secrets, logge
 	defer shutdownCancel()
 	code := 0
 	if err := svc.Shutdown(shutdownCtx); err != nil {
-		logger.Error("shutdown incomplete; recovery records retained", "error", err.Error())
+		logger.Error("shutdown incomplete; recovery records retained", "error", safeErr(err))
 		code = 3
 	}
 	svcCancel()
-	if err := bridge.Close(shutdownCtx); err != nil {
-		logger.Warn("watch close", "error", err.Error())
+	// The watch service gets its own bounded budget: the shutdown context
+	// is usually exhausted on exactly the path where teardown matters, and
+	// the store pool must not close under live poll workers. Upstream
+	// documents that a timed-out close may be repeated.
+	for attempt := 0; attempt < 2; attempt++ {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := bridge.Close(closeCtx)
+		closeCancel()
+		if err == nil {
+			break
+		}
+		logger.Warn("watch close", "attempt", attempt+1, "error", safeErr(err))
 	}
 	if exitErr != nil && code == 0 {
 		code = 1

@@ -683,6 +683,14 @@ func TestDeliveryLifecycle(t *testing.T) {
 		t.Fatalf("Resend on non-failed row err = %v, want ErrConflict", err)
 	}
 
+	// A resolved row can never be failed; raise its desired revision first
+	// (a later committed edit) so it is unresolved again.
+	if err := st.MarkFailed(ctx, d0ID, "boom"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("MarkFailed on resolved row err = %v, want ErrConflict", err)
+	}
+	if err := st.SetDesired(ctx, d0ID, "revised", 2); err != nil {
+		t.Fatalf("SetDesired: %v", err)
+	}
 	if err := st.MarkFailed(ctx, d0ID, "boom"); err != nil {
 		t.Fatalf("MarkFailed: %v", err)
 	}

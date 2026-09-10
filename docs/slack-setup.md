@@ -39,12 +39,20 @@ cat > .slack/hooks.json <<'HOOKS'
  "config": {"manifest": {"source": "local"}, "sdk-managed-connection-enabled": true}}
 HOOKS
 printf '#!/bin/sh\ncat "$(dirname "$0")/manifest.json"\n' > get-manifest.sh
-chmod +x get-manifest.sh
+cat > start.sh <<'START'
+#!/bin/sh
+# The CLI supplies SLACK_BOT_TOKEN and SLACK_APP_TOKEN. Export the rest
+# from your own environment. Never echo these variables and never use set -x.
+cd /path/to/eino-channels || exit 1
+exec ./eino-channels serve --config config.json
+START
+chmod +x get-manifest.sh start.sh
 slack manifest validate
 slack app install --team <TEAM_ID> --environment local
+slack platform run --team <TEAM_ID>
 ```
 
-`slack platform run` then starts `start.sh` with `SLACK_BOT_TOKEN` and
-`SLACK_APP_TOKEN` in its environment; a start hook that exports the other
-credentials and execs `eino-channels serve --config config.json` runs the
-service without ever writing the tokens to disk. Never echo those variables.
+`slack platform run` starts `start.sh` with `SLACK_BOT_TOKEN` and
+`SLACK_APP_TOKEN` in its environment, so the service itself never writes
+the tokens to disk. The Slack CLI keeps its own login under `~/.slack/`;
+treat that directory as sensitive.

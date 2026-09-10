@@ -187,14 +187,21 @@ func (s *Service) admit(conv state.Conversation, item state.Item, dest state.Des
 				_ = s.st.Transition(s.ctx, item.ID, state.StateAdmitting, state.StateRejected, state.CodeConflict)
 				s.Notify(dest, NoticeConflict)
 				return session.AdmissionReceipt{}, nil, noop, workDone
-			case errors.Is(err, session.ErrAdmissionInvalid):
+			case errors.Is(err, session.ErrAdmissionInvalid), errors.Is(err, session.ErrAdmissionUnknown):
+				// Unknown covers a receipt written by a different fingerprint
+				// version: retrying cannot succeed, so reject with the same
+				// safe notice as a conflict.
 				_ = s.st.Transition(s.ctx, item.ID, state.StateAdmitting, state.StateRejected, state.CodeConflict)
 				s.Notify(dest, NoticeConflict)
 				return session.AdmissionReceipt{}, nil, noop, workDone
 			case errors.Is(err, session.ErrSessionBusy):
 				// Another run owns the session (an abandoned lease). Let it settle.
 				s.log.Warn("session busy at admission; waiting for lease recovery")
-				time.Sleep(time.Duration(config.AgentLeaseSeconds) * time.Second)
+				select {
+				case <-time.After(time.Duration(config.AgentLeaseSeconds) * time.Second):
+				case <-s.ctx.Done():
+					return session.AdmissionReceipt{}, nil, noop, workStop
+				}
 				continue
 			}
 			s.log.Warn("admission attempt failed", "error", safeErr(err))
@@ -467,7 +474,13 @@ func (p *projection) consume() {
 		p.mu.Unlock()
 		u, err := sub.Next(p.ctx)
 		if err != nil {
-			if errors.Is(err, watch.ErrResyncRequired) && p.resyncs < maxWatchResyncs {
+			if p.ctx.Err() != nil {
+				return
+			}
+			// Any subscription death (resync required, a store read timeout,
+			// capacity) costs the live prefix; re-watch a bounded number of
+			// times and say so when giving up.
+			if p.resyncs < maxWatchResyncs {
 				p.resyncs++
 				select {
 				case <-time.After(time.Duration(p.resyncs) * 200 * time.Millisecond):
@@ -484,6 +497,7 @@ func (p *projection) consume() {
 					continue
 				}
 			}
+			p.s.log.Warn("watch subscription ended; previews unavailable for the rest of this turn", "resync", errors.Is(err, watch.ErrResyncRequired), "error", safeErr(err))
 			return
 		}
 		switch u.Kind {
@@ -573,6 +587,13 @@ func (p *projection) flushLoop() {
 // delivery lane is clear up to this run. It returns false when previews
 // must be skipped for this turn.
 func (p *projection) ensurePreviewRow() bool {
+	// The recheck is a precondition of every dispatch, previews included.
+	actx, acancel := context.WithTimeout(p.ctx, p.s.platformTimeout())
+	allowed, aerr := p.deliverer.Allowed(actx, p.conv.Route.Destination())
+	acancel()
+	if aerr != nil || !allowed {
+		return false
+	}
 	row, err := p.s.st.PlanPreview(p.ctx, p.item, p.deliverer.Preview(""))
 	if err != nil {
 		return false

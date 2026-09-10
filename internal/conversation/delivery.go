@@ -15,6 +15,7 @@ const limiterPruneAge = 10 * time.Minute
 // destination. It returns the context error when the wait is cut short so
 // the caller skips the call instead of sending with a dead context.
 func (s *Service) throttle(ctx context.Context, dest state.Destination) error {
+	dest.DMActor = "" // spacing is per address; the actor is not part of it
 	s.limiterMu.Lock()
 	now := time.Now()
 	if len(s.limiterLast) > 1024 {
@@ -36,6 +37,10 @@ func (s *Service) throttle(ctx context.Context, dest state.Destination) error {
 		select {
 		case <-time.After(wait):
 		case <-ctx.Done():
+			// Give the slot back: nothing was dispatched.
+			s.limiterMu.Lock()
+			s.limiterLast[dest] = last
+			s.limiterMu.Unlock()
 			return ctx.Err()
 		}
 	}
@@ -133,9 +138,10 @@ func (s *Service) createDelivery(ctx context.Context, d Deliverer, row state.Del
 		if wait <= 0 {
 			wait = backoff(intent.Attempts)
 		}
-		s.recordf(s.st.MarkAttempt(ctx, intent.ID, time.Now().Add(min(wait, 5*time.Minute))), "mark attempt", intent.ID)
+		// The intent already counted this attempt.
+		s.recordf(s.st.MarkRetryAt(ctx, intent.ID, time.Now().Add(min(wait, 5*time.Minute))), "mark retry", intent.ID)
 	default:
-		s.recordf(s.st.MarkAttempt(ctx, intent.ID, time.Now().Add(backoff(intent.Attempts))), "mark attempt", intent.ID)
+		s.recordf(s.st.MarkRetryAt(ctx, intent.ID, time.Now().Add(backoff(intent.Attempts))), "mark retry", intent.ID)
 	}
 	return false, true
 }

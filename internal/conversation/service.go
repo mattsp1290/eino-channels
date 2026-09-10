@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -30,14 +31,12 @@ const (
 
 // Fixed user-facing texts.
 const (
-	NoticeHelp         = "I answer plain-text questions in DMs and when you mention me in an allowed channel. In shared threads, mention me on every message. Commands: !stop interrupts the current answer, !new starts a fresh conversation (thread creator only), !help shows this. Limits: prompts up to 16 KiB, 100 turns per conversation, answers up to 32 KiB. Attached files are not read."
 	NoticeBusyNew      = "Finish or resolve pending work before starting a new conversation."
 	NoticeNewStarted   = "Started a new conversation."
 	NoticeStopped      = "Stopped."
 	NoticeNothingToDo  = "Nothing is running."
 	NoticeDenied       = "You are not allowed to control this conversation."
 	NoticeOverflow     = "I am at capacity right now. Please try again in a moment."
-	NoticeOversize     = "That message is too long. Please keep prompts under 16 KiB."
 	NoticeHistoryLimit = "This conversation has reached its history limit. Use !new to start a fresh one."
 	NoticeFiles        = "Note: attached files are not read; only the text was used."
 	NoticeConflict     = "This message could not be processed. Please send it again as a new message."
@@ -51,6 +50,28 @@ const (
 	TextInterruptedNil = "(This answer was interrupted by a service restart before any text was produced. You can continue the conversation.)"
 	TextUnavailable    = "(The response could not be displayed.)"
 )
+
+// Notices that depend on the configured prompt limit. The exported values
+// render the default limit; the service renders its own configured value.
+var (
+	NoticeHelp     = helpNotice(config.DefaultLimits().MaxPromptBytes)
+	NoticeOversize = oversizeNotice(config.DefaultLimits().MaxPromptBytes)
+)
+
+func kib(n int) string {
+	if n%1024 == 0 {
+		return fmt.Sprintf("%d KiB", n/1024)
+	}
+	return fmt.Sprintf("%d bytes", n)
+}
+
+func helpNotice(maxPromptBytes int) string {
+	return fmt.Sprintf("I answer plain-text questions in DMs and when you mention me in an allowed channel. In shared threads, mention me on every message. Commands: !stop interrupts the current answer, !new starts a fresh conversation (thread creator only), !help shows this. Limits: prompts up to %s, %d turns per conversation, answers up to %s. Attached files are not read.", kib(maxPromptBytes), config.MaxHistoryTurns, kib(config.MaxOutputBytes))
+}
+
+func oversizeNotice(maxPromptBytes int) string {
+	return fmt.Sprintf("That message is too long. Please keep prompts under %s.", kib(maxPromptBytes))
+}
 
 // ErrClosing is returned by Ingest during shutdown; adapters must not
 // acknowledge the platform event so it is redelivered later.
@@ -241,7 +262,7 @@ func (s *Service) Ingest(ctx context.Context, in state.Inbound) (Response, error
 		case state.CodeOverflow:
 			resp.Notice = NoticeOverflow
 		case state.CodeOversize:
-			resp.Notice = NoticeOversize
+			resp.Notice = oversizeNotice(s.limits.MaxPromptBytes)
 		case state.CodeBusy:
 			resp.Notice = NoticeBusyNew
 		case state.CodeDenied:
@@ -251,7 +272,7 @@ func (s *Service) Ingest(ctx context.Context, in state.Inbound) (Response, error
 	}
 	switch in.Kind {
 	case state.KindHelp:
-		resp.Notice = NoticeHelp
+		resp.Notice = helpNotice(s.limits.MaxPromptBytes)
 	case state.KindNew:
 		resp.Notice = NoticeNewStarted
 	case state.KindStop:
@@ -419,7 +440,10 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		_ = h.Interrupt(ictx, "service shutdown")
 		cancel()
 	}
-	if s.cancel == nil {
+	s.mu.Lock()
+	cancel := s.cancel
+	s.mu.Unlock()
+	if cancel == nil {
 		return nil
 	}
 	done := make(chan struct{})
@@ -431,7 +455,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		err = errors.New("shutdown deadline exceeded; recovery records retained")
 	}
-	s.cancel()
+	cancel()
 	// After cancellation every runner path observes s.ctx and returns
 	// promptly; bound the wait anyway so a stuck platform call cannot hold
 	// the process past its exit deadline.
@@ -444,12 +468,16 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	return err
 }
 
-// safeErr renders an error for logs without provider or platform bodies.
+var tokenShapes = regexp.MustCompile(`xox[abp]-[A-Za-z0-9-]+|xapp-[A-Za-z0-9-]+|Bot [A-Za-z0-9._-]{20,}|Bearer [A-Za-z0-9._-]{16,}`)
+
+// safeErr renders an error for logs: known token shapes are redacted and
+// the text is truncated on a rune boundary. It does not make arbitrary
+// error bodies safe; callers still avoid logging provider or platform bodies.
 func safeErr(err error) string {
 	if err == nil {
 		return ""
 	}
-	msg := err.Error()
+	msg := tokenShapes.ReplaceAllString(err.Error(), "<redacted>")
 	if len(msg) > 200 {
 		cut := 200
 		for cut > 0 && !utf8.RuneStart(msg[cut]) {

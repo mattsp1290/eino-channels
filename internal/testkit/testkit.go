@@ -139,6 +139,9 @@ type Deliverer struct {
 	Reconciled map[string]string // nonce -> remote id
 	// Deny, when non-nil, rejects destinations.
 	Deny func(state.Destination) bool
+	// AllowedErr, when non-nil, makes Allowed report that the check cannot
+	// be made now (an adapter whose identity is not established yet).
+	AllowedErr error
 	// Budget is the chunk budget.
 	Budget int
 }
@@ -227,9 +230,19 @@ func (d *Deliverer) Reconcile(_ context.Context, dest state.Destination, nonce s
 // Allowed implements conversation.Deliverer.
 func (d *Deliverer) Allowed(_ context.Context, dest state.Destination) (bool, error) {
 	d.mu.Lock()
-	deny := d.Deny
+	deny, err := d.Deny, d.AllowedErr
 	d.mu.Unlock()
+	if err != nil {
+		return false, err
+	}
 	return deny == nil || !deny(dest), nil
+}
+
+// SetAllowedErr sets AllowedErr under the lock.
+func (d *Deliverer) SetAllowedErr(err error) {
+	d.mu.Lock()
+	d.AllowedErr = err
+	d.mu.Unlock()
 }
 
 // Notify implements conversation.Deliverer.

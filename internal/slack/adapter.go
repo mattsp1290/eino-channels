@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -49,6 +50,9 @@ type Adapter struct {
 	log      *slog.Logger
 	deadline time.Duration
 
+	// identity is written once by setIdentity and read by the event loop;
+	// guarded because Run and tests may call Identity from another goroutine.
+	idMu      sync.Mutex
 	botUserID string
 	mention   *regexp.Regexp
 	healthy   atomic.Bool
@@ -63,7 +67,7 @@ func New(opts Options) (*Adapter, error) {
 		opts.Logger = slog.Default()
 	}
 	if opts.PersistDeadline <= 0 {
-		opts.PersistDeadline = 2 * time.Second
+		opts.PersistDeadline = time.Second // target well inside Slack's 3 s ack window
 	}
 	apiOpts := []slack.Option{slack.OptionAppLevelToken(opts.AppToken), slack.OptionDebug(false)}
 	if opts.APIURL != "" {
@@ -101,9 +105,17 @@ func (a *Adapter) Identity(ctx context.Context) error {
 }
 
 func (a *Adapter) setIdentity(_, botUserID string) {
+	a.idMu.Lock()
 	a.botUserID = botUserID
 	a.mention = regexp.MustCompile(`<@` + regexp.QuoteMeta(botUserID) + `(\|[^>]*)?>`)
+	a.idMu.Unlock()
 	a.healthy.Store(true)
+}
+
+func (a *Adapter) identity() (string, *regexp.Regexp) {
+	a.idMu.Lock()
+	defer a.idMu.Unlock()
+	return a.botUserID, a.mention
 }
 
 // Healthy reports whether the adapter is connected with valid auth.
@@ -171,7 +183,8 @@ func (a *Adapter) ack(req *socketmode.Request) {
 // handleEventsAPI returns true when the envelope should be acknowledged.
 // Runnable input is acknowledged only after durable storage succeeds.
 func (a *Adapter) handleEventsAPI(ctx context.Context, payload slackevents.EventsAPIEvent) bool {
-	if a.botUserID == "" {
+	botUserID, mention := a.identity()
+	if botUserID == "" || mention == nil {
 		return false // identity not established yet; let Slack retry
 	}
 	if payload.Type != slackevents.CallbackEvent || payload.TeamID != a.cfg.TeamID {
@@ -180,7 +193,7 @@ func (a *Adapter) handleEventsAPI(ctx context.Context, payload slackevents.Event
 	if cb, ok := payload.Data.(*slackevents.EventsAPICallbackEvent); payload.IsExtSharedChannel || ok && cb.IsExtSharedChannel {
 		return true
 	}
-	in, ok := a.normalize(payload.InnerEvent)
+	in, ok := a.normalize(payload.InnerEvent, botUserID, mention)
 	if !ok {
 		return true
 	}
@@ -198,7 +211,7 @@ func (a *Adapter) handleEventsAPI(ctx context.Context, payload slackevents.Event
 }
 
 // normalize converts a callback inner event into a validated Inbound.
-func (a *Adapter) normalize(inner slackevents.EventsAPIInnerEvent) (state.Inbound, bool) {
+func (a *Adapter) normalize(inner slackevents.EventsAPIInnerEvent, botUserID string, mention *regexp.Regexp) (state.Inbound, bool) {
 	var user, text, ts, threadTS, channel, botID, userTeam, sourceTeam string
 	var files, edited, dm bool
 	switch e := inner.Data.(type) {
@@ -223,7 +236,7 @@ func (a *Adapter) normalize(inner slackevents.EventsAPIInnerEvent) (state.Inboun
 	default:
 		return state.Inbound{}, false
 	}
-	if botID != "" || user == "" || user == a.botUserID || edited || ts == "" || channel == "" {
+	if botID != "" || user == "" || user == botUserID || edited || ts == "" || channel == "" {
 		return state.Inbound{}, false
 	}
 	if userTeam != "" && userTeam != a.cfg.TeamID || sourceTeam != "" && sourceTeam != a.cfg.TeamID {
@@ -239,7 +252,7 @@ func (a *Adapter) normalize(inner slackevents.EventsAPIInnerEvent) (state.Inboun
 		if !a.channels.Contains(channel) {
 			return state.Inbound{}, false
 		}
-		if !a.mention.MatchString(text) {
+		if !mention.MatchString(text) {
 			return state.Inbound{}, false // shared-thread follow-ups require a fresh mention
 		}
 		route.ThreadRoot = threadTS
@@ -247,7 +260,7 @@ func (a *Adapter) normalize(inner slackevents.EventsAPIInnerEvent) (state.Inboun
 			route.ThreadRoot = ts
 		}
 	}
-	text = strings.TrimSpace(a.mention.ReplaceAllString(text, ""))
+	text = strings.TrimSpace(mention.ReplaceAllString(text, ""))
 	if text == "" {
 		return state.Inbound{}, false // blank or attachment-only
 	}
@@ -334,6 +347,13 @@ func classify(err error, create bool) error {
 	var api slack.SlackErrorResponse
 	if errors.As(err, &api) {
 		switch api.Err {
+		case "fatal_error", "internal_error":
+			// Slack documents these as possibly partially applied; a create
+			// may have landed and Slack has no nonce to check.
+			if create {
+				return &conversation.DeliveryError{Kind: conversation.KindAmbiguous, Err: errors.New("slack: " + api.Err)}
+			}
+			return &conversation.DeliveryError{Kind: conversation.KindDefinite, Err: errors.New("slack: " + api.Err)}
 		case "channel_not_found", "not_in_channel", "is_archived", "invalid_auth", "account_inactive", "token_revoked", "missing_scope", "msg_too_long", "restricted_action", "message_not_found", "cant_update_message", "not_authed", "no_permission", "ekm_access_denied":
 			return &conversation.DeliveryError{Kind: conversation.KindPermanent, Err: errors.New("slack: " + api.Err)}
 		}

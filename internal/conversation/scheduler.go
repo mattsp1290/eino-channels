@@ -7,10 +7,11 @@ import (
 )
 
 const (
-	scheduleTick    = time.Second
-	routeBatch      = 64
-	parkBlocked     = 10 * time.Minute // operator resolution restarts the service anyway
-	parkUnavailable = 15 * time.Second
+	scheduleTick     = time.Second
+	routeBatch       = 64
+	maxIngestEntries = 4096
+	parkBlocked      = 10 * time.Minute // operator resolution restarts the service anyway
+	parkUnavailable  = 15 * time.Second
 )
 
 // scheduler spawns bounded route runners for routes that have work.
@@ -95,6 +96,17 @@ func (s *Service) unpark(key string) {
 	delete(s.parked, key)
 	s.ingests[key]++
 	s.rescan = true
+	if len(s.ingests) > maxIngestEntries {
+		// Drop counters for idle routes; a dropped counter makes a stale
+		// park decision refuse to park, which is the safe direction.
+		for k := range s.ingests {
+			_, active := s.active[k]
+			_, parked := s.parked[k]
+			if !active && !parked {
+				delete(s.ingests, k)
+			}
+		}
+	}
 	s.mu.Unlock()
 }
 

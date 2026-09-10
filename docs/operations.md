@@ -32,12 +32,17 @@
 Interrupted partial text is shown in chat but is not part of the model's
 history: the agent runtime commits only completed answers.
 
+Notices (`!help`, `!new`, denied, capacity, "Stopped.") are transient
+best-effort sends through a bounded queue: they can be dropped under load
+and are not recovered after a crash. The control itself is recorded
+durably before the notice is attempted.
+
 ## Delivery guarantees
 
 Admission is exactly-once per platform message. External sends are not:
 a create can succeed without a response. Such a delivery is recorded as
 `ambiguous_create` and blocks later output on the same conversation until an
-operator resolves it. Definite failures are retried up to 5 times within 10
+operator resolves it. Definite failures are retried with backoff, up to 5 attempts within 10
 minutes, then marked `failed`. The model answer is never regenerated to repair
 a send.
 
@@ -50,7 +55,8 @@ eino-channels delivery list --config config.json
 ```
 
 Lists unresolved rows: ID, platform, status, operation state, attempts,
-chunk index, destination channel and thread. Bodies are never printed.
+chunk index, destination channel and thread (for Discord the channel is the
+thread and the last column is the guild). Bodies are never printed.
 
 ```
 eino-channels delivery resolve --config config.json --id <id> \

@@ -716,7 +716,7 @@ func TestDeliverySeam(t *testing.T) {
 	})
 
 	t.Run("unknown api error maps to KindDefinite", func(t *testing.T) {
-		h.fake.queuePost(fakeResp{ok: false, errCode: "fatal_error"})
+		h.fake.queuePost(fakeResp{ok: false, errCode: "invalid_arguments"})
 		dest := state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "C1"}
 		_, err := d.Create(ctx, dest, "x", "")
 		var de *conversation.DeliveryError
@@ -725,6 +725,23 @@ func TestDeliverySeam(t *testing.T) {
 		}
 		if de.Kind != conversation.KindDefinite {
 			t.Errorf("Kind = %v, want KindDefinite", de.Kind)
+		}
+	})
+
+	t.Run("fatal_error on create is ambiguous, on edit definite", func(t *testing.T) {
+		dest := state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "C1"}
+		for _, code := range []string{"fatal_error", "internal_error"} {
+			h.fake.queuePost(fakeResp{ok: false, errCode: code})
+			_, err := d.Create(ctx, dest, "x", "")
+			var de *conversation.DeliveryError
+			if !errors.As(err, &de) || de.Kind != conversation.KindAmbiguous {
+				t.Errorf("create %s: err = %v, want KindAmbiguous", code, err)
+			}
+			h.fake.queueUpdate(fakeResp{ok: false, errCode: code})
+			err = d.Edit(ctx, dest, "1700000000.000100", "x")
+			if !errors.As(err, &de) || de.Kind != conversation.KindDefinite {
+				t.Errorf("edit %s: err = %v, want KindDefinite", code, err)
+			}
 		}
 	})
 

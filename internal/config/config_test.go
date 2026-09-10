@@ -119,6 +119,34 @@ func TestParseRejects(t *testing.T) {
 			wantSubstr: "slack.allowed_user_ids contains a duplicate ID",
 		},
 		{
+			name: "duplicate slack channel ids",
+			build: func() Config {
+				c := validSlackConfig()
+				c.Slack.AllowedChannelIDs = []string{"C12345678", "C12345678"}
+				return c
+			},
+			wantSubstr: "slack.allowed_channel_ids contains a duplicate ID",
+		},
+		{
+			name: "duplicate discord guild ids",
+			build: func() Config {
+				c := validDiscordConfig()
+				c.Discord.GuildIDs = []string{"100000000000000001", "100000000000000001"}
+				return c
+			},
+			wantSubstr: "discord.guild_ids contains a duplicate ID",
+		},
+		{
+			name: "duplicate discord channel ids",
+			build: func() Config {
+				c := validDiscordConfig()
+				c.Discord.GuildIDs = []string{"100000000000000001"}
+				c.Discord.AllowedChannelIDs = []string{"200000000000000001", "200000000000000001"}
+				return c
+			},
+			wantSubstr: "discord.allowed_channel_ids contains a duplicate ID",
+		},
+		{
 			name:       "discord enabled with empty allowed_user_ids",
 			build:      func() Config { c := validDiscordConfig(); c.Discord.AllowedUserIDs = nil; return c },
 			wantSubstr: "discord.allowed_user_ids must not be empty",

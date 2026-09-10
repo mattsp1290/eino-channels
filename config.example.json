@@ -1,0 +1,24 @@
+{
+  "state_dir": "/var/lib/eino-channels",
+  "slack": {
+    "enabled": true,
+    "team_id": "T0123456789",
+    "allowed_channel_ids": ["C0123456789"],
+    "allowed_user_ids": ["U0123456789"]
+  },
+  "discord": {
+    "enabled": true,
+    "guild_ids": ["100000000000000001"],
+    "allowed_channel_ids": ["200000000000000001"],
+    "allowed_user_ids": ["300000000000000001"]
+  },
+  "limits": {
+    "max_running_conversations": 4,
+    "max_queued_per_conversation": 8,
+    "max_pending_inbox": 256,
+    "max_prompt_bytes": 16384,
+    "model_turn_seconds": 120,
+    "platform_call_seconds": 10,
+    "shutdown_seconds": 10
+  }
+}

@@ -30,3 +30,15 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# eino-channels local state and binaries
+/eino-channels
+/state/
+*.db
+*.db-wal
+*.db-shm
+/config.json
+/reviews/
+
+# agent planning artifacts (kept out of the repository by default)
+/.agents/

@@ -142,7 +142,7 @@ func Serve(ctx context.Context, cfg config.Config, secrets config.Secrets, logge
 	var slackAdapter *slack.Adapter
 	var discordAdapter *discord.Adapter
 	if cfg.Slack.Enabled {
-		slackAdapter, err = slack.New(slack.Options{Config: cfg.Slack, BotToken: secrets.SlackBotToken, AppToken: secrets.SlackAppToken, Logger: logger, UserAgent: UserAgent})
+		slackAdapter, err = slack.New(slack.Options{Config: cfg.Slack, BotToken: secrets.SlackBotToken, AppToken: secrets.SlackAppToken, Logger: logger})
 		if err != nil {
 			return 1, err
 		}
@@ -159,18 +159,22 @@ func Serve(ctx context.Context, cfg config.Config, secrets config.Secrets, logge
 	if err != nil {
 		return 1, err
 	}
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	svc.Start(runCtx)
+	// The service context outlives the adapters: ingress stops first, then
+	// the service settles owned work within its shutdown budget.
+	svcCtx, svcCancel := context.WithCancel(context.Background())
+	defer svcCancel()
+	svc.Start(svcCtx)
+	adapterCtx, adapterCancel := context.WithCancel(ctx)
+	defer adapterCancel()
 
 	fatal := make(chan error, 2)
 	if slackAdapter != nil {
 		slackAdapter.Attach(svc)
-		go func() { fatal <- slackAdapter.Run(runCtx) }()
+		go func() { fatal <- slackAdapter.Run(adapterCtx) }()
 	}
 	if discordAdapter != nil {
 		discordAdapter.Attach(svc)
-		go func() { fatal <- discordAdapter.Run(runCtx) }()
+		go func() { fatal <- discordAdapter.Run(adapterCtx) }()
 	}
 	logger.Info("eino-channels serving", "version", Version, "slack", cfg.Slack.Enabled, "discord", cfg.Discord.Enabled)
 
@@ -193,7 +197,7 @@ func Serve(ctx context.Context, cfg config.Config, secrets config.Secrets, logge
 			}
 		}
 	}
-	cancel()
+	adapterCancel()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.ShutdownSeconds)*time.Second)
 	defer shutdownCancel()
 	code := 0
@@ -201,6 +205,7 @@ func Serve(ctx context.Context, cfg config.Config, secrets config.Secrets, logge
 		logger.Error("shutdown incomplete; recovery records retained", "error", err.Error())
 		code = 3
 	}
+	svcCancel()
 	if err := bridge.Close(shutdownCtx); err != nil {
 		logger.Warn("watch close", "error", err.Error())
 	}

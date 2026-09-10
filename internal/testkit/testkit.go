@@ -225,11 +225,11 @@ func (d *Deliverer) Reconcile(_ context.Context, dest state.Destination, nonce s
 }
 
 // Allowed implements conversation.Deliverer.
-func (d *Deliverer) Allowed(dest state.Destination) bool {
+func (d *Deliverer) Allowed(_ context.Context, dest state.Destination) (bool, error) {
 	d.mu.Lock()
 	deny := d.Deny
 	d.mu.Unlock()
-	return deny == nil || !deny(dest)
+	return deny == nil || !deny(dest), nil
 }
 
 // Notify implements conversation.Deliverer.
@@ -339,6 +339,13 @@ func Open(t testing.TB, opts Options) *Env {
 		t.Fatalf("service: %v", err)
 	}
 	env := &Env{T: t, Dir: opts.Dir, Store: st, Bridge: bridge, Service: svc, Deliverer: opts.Deliverer, Script: opts.Script, Logs: logs}
+	if tt, ok := t.(*testing.T); ok {
+		tt.Cleanup(func() {
+			if tt.Failed() {
+				tt.Logf("service logs:\n%s", logs.String())
+			}
+		})
+	}
 	if opts.Started {
 		env.Start()
 	}

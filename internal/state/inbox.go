@@ -106,8 +106,15 @@ func (s *Store) Ingest(ctx context.Context, in Inbound, cap Capacity) (Dispositi
 				return storageErr(err)
 			}
 			item.StopCutoffSeq = cutoff.Int64
-			if _, err := tx.ExecContext(ctx, `UPDATE inbox SET state = ?, result_code = ?, content = NULL, updated_at = ? WHERE route_key = ? AND state = ? AND kind = ? AND seq <= ?`, StateCanceled, CodeCanceled, now.UnixNano(), key, StateQueued, KindPrompt, cutoff.Int64); err != nil {
+			res, err := tx.ExecContext(ctx, `UPDATE inbox SET state = ?, result_code = ?, content = NULL, updated_at = ? WHERE route_key = ? AND state = ? AND kind = ? AND seq <= ?`, StateCanceled, CodeCanceled, now.UnixNano(), key, StateQueued, KindPrompt, cutoff.Int64)
+			if err != nil {
 				return storageErr(err)
+			}
+			canceled, _ := res.RowsAffected()
+			if canceled == 0 && item.StopTargetInboxID == 0 {
+				// Nothing was running or queued: the control is complete on arrival.
+				item.State = StateComplete
+				d.StopNoop = true
 			}
 			item.Content = ""
 		case in.Kind == KindNew:
@@ -178,13 +185,15 @@ func (s *Store) NextWork(ctx context.Context, routeKey string) (Item, error) {
 	return scanItem(s.host.QueryRowContext(ctx, `SELECT `+itemColumns+` FROM inbox WHERE route_key = ? AND state IN (?, ?, ?) ORDER BY seq LIMIT 1`, routeKey, StateAdmitting, StateAdmitted, StateQueued))
 }
 
-// RoutesWithWork lists route keys that have runnable or recoverable inbox
-// work or unresolved deliveries, bounded by limit.
-func (s *Store) RoutesWithWork(ctx context.Context, limit int) ([]string, error) {
+// RoutesWithWork lists route keys greater than after that have runnable or
+// recoverable inbox work or unresolved deliveries, bounded by limit. The
+// scheduler rotates the cursor so no route starves behind lexicographically
+// smaller ones.
+func (s *Store) RoutesWithWork(ctx context.Context, after string, limit int) ([]string, error) {
 	rows, err := s.host.QueryContext(ctx, `SELECT route_key FROM (
 		SELECT route_key FROM inbox WHERE state IN (?, ?, ?, ?)
-		UNION SELECT route_key FROM deliveries WHERE status = ? AND NOT (acked_revision = desired_revision AND op_state = ?)
-	) ORDER BY route_key LIMIT ?`, StateQueued, StateAdmitting, StateAdmitted, StatePending, DeliveryPending, OpAcked, limit)
+		UNION SELECT route_key FROM deliveries WHERE `+unresolvedDelivery+`
+	) WHERE route_key > ? ORDER BY route_key LIMIT ?`, StateQueued, StateAdmitting, StateAdmitted, StatePending, after, limit)
 	if err != nil {
 		return nil, storageErr(err)
 	}
@@ -262,8 +271,8 @@ func (s *Store) MarkTerminal(ctx context.Context, id int64, runStatus, code stri
 		if item.State == StateTerminal {
 			return nil
 		}
-		if item.State != StateAdmitted && item.State != StateAdmitting {
-			return fmt.Errorf("%w: inbox %d is %s", ErrConflict, id, item.State)
+		if item.State != StateAdmitted || item.RunID == "" {
+			return fmt.Errorf("%w: inbox %d is %s without a run", ErrConflict, id, item.State)
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE inbox SET state = ?, run_status = ?, result_code = ?, content = NULL, updated_at = ? WHERE id = ?`, StateTerminal, runStatus, code, time.Now().UnixNano(), id); err != nil {
 			return storageErr(err)
@@ -278,7 +287,8 @@ func (s *Store) PendingStops(ctx context.Context, routeKey string) ([]Item, erro
 }
 
 // RecoveryItems lists prompt items that were admitting or admitted when the
-// process last stopped, bounded by limit.
+// process last stopped, bounded by limit. It is a diagnostic helper: the
+// scheduler recovers through RoutesWithWork and NextWork.
 func (s *Store) RecoveryItems(ctx context.Context, limit int) ([]Item, error) {
 	return s.listItems(ctx, `SELECT `+itemColumns+` FROM inbox WHERE kind = ? AND state IN (?, ?) ORDER BY id LIMIT ?`, KindPrompt, StateAdmitting, StateAdmitted, limit)
 }

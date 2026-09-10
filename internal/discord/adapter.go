@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bwmarrin/discordgo"
 
@@ -76,7 +77,7 @@ type Adapter struct {
 // New builds the adapter without network calls.
 func New(opts Options) (*Adapter, error) {
 	if opts.Store == nil || opts.Token == "" {
-		return nil, errors.New("discord: service, store and token required")
+		return nil, errors.New("discord: store and token required")
 	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
@@ -107,11 +108,14 @@ func New(opts Options) (*Adapter, error) {
 	return a, nil
 }
 
+// setBot publishes the mention pattern before the bot ID: handlers treat a
+// non-empty BotID as readiness, and DiscordGo dispatches Ready and
+// MessageCreate on separate goroutines.
 func (a *Adapter) setBot(id string) {
-	a.botID.Store(id)
 	a.mu.Lock()
 	a.mention = regexp.MustCompile(`<@!?` + regexp.QuoteMeta(id) + `>`)
 	a.mu.Unlock()
+	a.botID.Store(id)
 	a.healthy.Store(true)
 	a.once.Do(func() { close(a.ready) })
 }
@@ -179,6 +183,9 @@ func (a *Adapter) HandleMessage(ctx context.Context, m *discordgo.Message) {
 	a.mu.Lock()
 	mention := a.mention
 	a.mu.Unlock()
+	if mention == nil {
+		return
+	}
 	text := strings.TrimSpace(mention.ReplaceAllString(m.Content, ""))
 	route := state.Route{Platform: state.PlatformDiscord, Installation: bot}
 	if m.GuildID == "" {
@@ -277,17 +284,17 @@ func (a *Adapter) threadFor(ctx context.Context, m *discordgo.Message) (string, 
 	if id, err := a.st.LookupThread(ctx, state.PlatformDiscord, bot, m.ID); err == nil {
 		return id, true
 	}
+	if m.Thread != nil && m.Thread.ID != "" {
+		return a.bind(ctx, m.ID, m.Thread.ID)
+	}
 	// A previous ambiguous creation may already have produced the thread.
 	if msg, err := a.s.ChannelMessage(m.ChannelID, m.ID, discordgo.WithContext(ctx)); err == nil && msg != nil && msg.Thread != nil && msg.Thread.ID != "" {
 		return a.bind(ctx, m.ID, msg.Thread.ID)
 	}
-	if m.Thread != nil && m.Thread.ID != "" {
-		return a.bind(ctx, m.ID, m.Thread.ID)
-	}
 	ch, err := a.s.MessageThreadStartComplex(m.ChannelID, m.ID, &discordgo.ThreadStart{Name: threadName, AutoArchiveDuration: threadArchiveMins}, discordgo.WithContext(ctx))
-	if err != nil || ch == nil {
+	if err != nil || ch == nil || ch.ID == "" {
 		// Unknown outcome: check once more through the message relationship.
-		if msg, err := a.s.ChannelMessage(m.ChannelID, m.ID, discordgo.WithContext(ctx)); err == nil && msg != nil && msg.Thread != nil {
+		if msg, err := a.s.ChannelMessage(m.ChannelID, m.ID, discordgo.WithContext(ctx)); err == nil && msg != nil && msg.Thread != nil && msg.Thread.ID != "" {
 			return a.bind(ctx, m.ID, msg.Thread.ID)
 		}
 		return "", false
@@ -296,6 +303,9 @@ func (a *Adapter) threadFor(ctx context.Context, m *discordgo.Message) (string, 
 }
 
 func (a *Adapter) bind(ctx context.Context, sourceID, threadID string) (string, bool) {
+	if threadID == "" || sourceID == "" {
+		return "", false
+	}
 	bound, err := a.st.BindThread(ctx, state.PlatformDiscord, a.BotID(), sourceID, threadID)
 	if err != nil {
 		return "", false
@@ -350,11 +360,23 @@ func (d *Deliverer) Edit(ctx context.Context, dest state.Destination, remoteID, 
 }
 
 type recentMessage struct {
-	ID     string `json:"id"`
-	Nonce  any    `json:"nonce"`
+	ID     string          `json:"id"`
+	Nonce  json.RawMessage `json:"nonce"`
 	Author struct {
 		ID string `json:"id"`
 	} `json:"author"`
+}
+
+// nonceEquals compares a raw JSON nonce (string or integer) with ours.
+func nonceEquals(raw json.RawMessage, nonce string) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var str string
+	if json.Unmarshal(raw, &str) == nil {
+		return str == nonce
+	}
+	return strings.Trim(string(raw), `"`) == nonce
 }
 
 // Reconcile scans recent destination messages for an own message carrying
@@ -373,7 +395,7 @@ func (d *Deliverer) Reconcile(ctx context.Context, dest state.Destination, nonce
 	}
 	bot := d.a.BotID()
 	for _, m := range msgs {
-		if m.Author.ID == bot && fmt.Sprint(m.Nonce) == nonce {
+		if m.Author.ID == bot && nonceEquals(m.Nonce, nonce) {
 			return m.ID, true, nil
 		}
 	}
@@ -381,27 +403,34 @@ func (d *Deliverer) Reconcile(ctx context.Context, dest state.Destination, nonce
 }
 
 // Allowed rechecks the destination: DMs by actor, threads by guild and
-// parent channel. Unresolvable parents fail closed.
-func (d *Deliverer) Allowed(dest state.Destination) bool {
-	if dest.Platform != state.PlatformDiscord || dest.Installation != d.a.BotID() || !d.a.Healthy() {
-		return false
+// parent channel. Transport health is not authorization: REST delivery is
+// independent of the Gateway. A lookup failure is reported as an error so
+// the caller retries later instead of failing the delivery.
+func (d *Deliverer) Allowed(ctx context.Context, dest state.Destination) (bool, error) {
+	if dest.Platform != state.PlatformDiscord || dest.Installation != d.a.BotID() {
+		return false, nil
 	}
 	if dest.DMActor != "" {
-		return d.a.users.Contains(dest.DMActor)
+		return d.a.users.Contains(dest.DMActor), nil
 	}
 	if !d.a.guilds.Contains(dest.ThreadRoot) {
-		return false
+		return false, nil
 	}
 	if d.a.channels.Contains(dest.Channel) {
-		return true // a text channel itself (notices only)
+		return true, nil // a text channel itself (notices only)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	ch, err := d.a.channel(ctx, dest.Channel)
-	if err != nil || ch.Type != discordgo.ChannelTypeGuildPublicThread {
-		return false
+	if err != nil {
+		var rest *discordgo.RESTError
+		if errors.As(err, &rest) && rest.Response != nil && (rest.Response.StatusCode == http.StatusNotFound || rest.Response.StatusCode == http.StatusForbidden) {
+			return false, nil
+		}
+		return false, err
 	}
-	return d.a.channels.Contains(ch.ParentID)
+	if ch.Type != discordgo.ChannelTypeGuildPublicThread {
+		return false, nil
+	}
+	return d.a.channels.Contains(ch.ParentID), nil
 }
 
 // Notify posts a transient notice.
@@ -450,10 +479,9 @@ func classify(err error, create bool) error {
 		}
 		return &conversation.DeliveryError{Kind: conversation.KindDefinite, Err: fmt.Errorf("discord: http %d", rest.Response.StatusCode)}
 	}
-	if errors.Is(err, context.Canceled) {
-		return &conversation.DeliveryError{Kind: conversation.KindDefinite, Err: err}
-	}
 	if create {
+		// Cancellation or a transport failure after a create was sent does
+		// not prove the server never processed it.
 		return &conversation.DeliveryError{Kind: conversation.KindAmbiguous, Err: errors.New("discord: transport failure")}
 	}
 	return &conversation.DeliveryError{Kind: conversation.KindDefinite, Err: errors.New("discord: transport failure")}
@@ -465,7 +493,11 @@ func safeErr(err error) string {
 	}
 	s := err.Error()
 	if len(s) > 120 {
-		s = s[:120]
+		cut := 120
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = s[:cut]
 	}
 	return s
 }

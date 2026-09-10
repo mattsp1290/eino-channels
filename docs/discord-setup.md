@@ -12,6 +12,8 @@
 Behavior:
 
 - DMs from allowed users are conversations; no mention required.
+- Addressing means the bot appears in the message's mentions: an explicit
+  `@bot` or a Discord reply to one of its messages both count.
 - In an allowed text channel, mentioning the bot creates a public thread
   named "Conversation" from your message; replies go there. Every follow-up
   in the thread, including `!stop`, `!new`, `!help`, needs a mention.

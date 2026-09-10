@@ -96,8 +96,9 @@ type Deliverer interface {
 	Edit(ctx context.Context, dest state.Destination, remoteID, text string) error
 	// Reconcile tries to identify an own message created with nonce.
 	Reconcile(ctx context.Context, dest state.Destination, nonce string) (remoteID string, found bool, err error)
-	// Allowed rechecks destination authorization before dispatch.
-	Allowed(dest state.Destination) bool
+	// Allowed rechecks destination authorization before dispatch. A false
+	// result is a denial; an error means the check could not be made now.
+	Allowed(ctx context.Context, dest state.Destination) (bool, error)
 	// Notify sends a transient, best-effort notice.
 	Notify(ctx context.Context, dest state.Destination, text string) error
 	// Chunks renders committed text into platform-safe ordered chunks.
@@ -140,8 +141,13 @@ type Service struct {
 	active    map[string]struct{}
 	parked    map[string]time.Time
 	handles   map[string]runtime.Handle
-	stopFlags map[string]bool
+	stopFlags map[string]bool   // keyed by run ID
+	ingests   map[string]uint64 // per-route ingest counter; parking is conditional on it
 	notices   chan notice
+
+	limiterMu   sync.Mutex
+	limiterLast map[state.Destination]time.Time
+	cursor      string
 }
 
 type notice struct {
@@ -167,8 +173,8 @@ func New(opts Options) (*Service, error) {
 		spacing: opts.DeliverySpacing,
 		limits:  opts.Limits, st: opts.Store, bridge: opts.Bridge, deliverers: opts.Deliverers, log: opts.Logger,
 		wake: make(chan struct{}, 1), sem: make(chan struct{}, opts.Limits.MaxRunningConversations),
-		active: map[string]struct{}{}, parked: map[string]time.Time{}, handles: map[string]runtime.Handle{}, stopFlags: map[string]bool{},
-		notices: make(chan notice, 64),
+		active: map[string]struct{}{}, parked: map[string]time.Time{}, handles: map[string]runtime.Handle{}, stopFlags: map[string]bool{}, ingests: map[string]uint64{},
+		notices: make(chan notice, 64), limiterLast: map[state.Destination]time.Time{},
 	}, nil
 }
 
@@ -206,11 +212,11 @@ func (s *Service) Ingest(ctx context.Context, in state.Inbound) (Response, error
 		if !utf8.ValidString(in.Content) || in.Content == "" {
 			return Response{}, errors.New("conversation: prompt must be nonempty valid UTF-8")
 		}
+		if !in.Route.IsDM() {
+			in.Content = "[" + in.ActorLabel + "] " + in.Content
+		}
 		if len(in.Content) > s.limits.MaxPromptBytes {
 			in.RejectCode = state.CodeOversize
-		}
-		if !in.Route.IsDM() && in.RejectCode == "" {
-			in.Content = "[" + in.ActorLabel + "] " + in.Content
 		}
 	} else if in.RejectCode == "" {
 		if code := s.authorizeControl(ctx, in); code != "" {
@@ -248,7 +254,7 @@ func (s *Service) Ingest(ctx context.Context, in state.Inbound) (Response, error
 	case state.KindNew:
 		resp.Notice = NoticeNewStarted
 	case state.KindStop:
-		if d.Item.StopTargetInboxID == 0 && d.Item.StopCutoffSeq == 0 {
+		if d.StopNoop {
 			resp.Notice = NoticeNothingToDo
 		}
 		s.interruptRoute(in.Route.Key(), d.Item.StopTargetRunID)
@@ -330,10 +336,18 @@ func (s *Service) noticeLoop() {
 			return
 		case n := <-s.notices:
 			d, ok := s.deliverers[n.dest.Platform]
-			if !ok || !d.Allowed(n.dest) {
+			if !ok {
 				continue
 			}
 			ctx, cancel := context.WithTimeout(s.ctx, s.platformTimeout())
+			if allowed, err := d.Allowed(ctx, n.dest); err != nil || !allowed {
+				cancel()
+				continue
+			}
+			if err := s.throttle(ctx, n.dest); err != nil {
+				cancel()
+				continue
+			}
 			if err := d.Notify(ctx, n.dest, n.text); err != nil {
 				s.log.Warn("notice failed", "platform", n.dest.Platform, "error", safeErr(err))
 			}
@@ -362,23 +376,25 @@ func (s *Service) interruptRoute(routeKey, targetRunID string) {
 	if targetRunID != "" && string(h.RunID()) != targetRunID {
 		return
 	}
-	s.setStopFlag(routeKey)
+	s.setStopFlag(string(h.RunID()))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = h.Interrupt(ctx, "user stop")
 }
 
-func (s *Service) setStopFlag(routeKey string) {
+// Stop flags are keyed by run ID so a stop that arrives around the
+// terminal boundary of run N can never relabel run N+1.
+func (s *Service) setStopFlag(runID string) {
 	s.mu.Lock()
-	s.stopFlags[routeKey] = true
+	s.stopFlags[runID] = true
 	s.mu.Unlock()
 }
 
-func (s *Service) consumeStopFlag(routeKey string) bool {
+func (s *Service) consumeStopFlag(runID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	v := s.stopFlags[routeKey]
-	delete(s.stopFlags, routeKey)
+	v := s.stopFlags[runID]
+	delete(s.stopFlags, runID)
 	return v
 }
 
@@ -411,7 +427,14 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		err = errors.New("shutdown deadline exceeded; recovery records retained")
 	}
 	s.cancel()
-	<-done
+	// After cancellation every runner path observes s.ctx and returns
+	// promptly; bound the wait anyway so a stuck platform call cannot hold
+	// the process past its exit deadline.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		s.log.Error("runners did not stop after cancellation; exiting with recovery records intact")
+	}
 	s.loops.Wait()
 	return err
 }

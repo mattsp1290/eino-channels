@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -24,6 +25,10 @@ func newNonce() string {
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:]) // 24 characters, within Discord's 25-character nonce limit
 }
+
+// unresolvedDelivery is the single definition of "this row still needs
+// work": every scan, count and lane query must use it so they cannot drift.
+const unresolvedDelivery = `NOT (status = 'acked' AND acked_revision = desired_revision)`
 
 const deliveryColumns = `d.id, d.route_key, d.generation, d.inbox_id, d.run_id, d.delivery_seq, d.chunk_index, d.platform, d.installation, d.channel, d.thread_root, c.dm_actor, d.remote_id, d.nonce, d.desired_revision, d.acked_revision, d.desired_text, d.content_hash, d.status, d.op_state, d.attempts, d.first_attempt_at, d.retry_at, d.audit, d.created_at, d.updated_at`
 
@@ -55,6 +60,9 @@ func scanDelivery(row interface{ Scan(...any) error }) (Delivery, error) {
 // planDeliveriesTx inserts rows for a terminal item. Chunk 0 may already
 // exist as the preview/status row; it is updated to the final revision.
 func planDeliveriesTx(ctx context.Context, tx *sql.Tx, item Item, plans []DeliveryPlan) error {
+	if item.RunID == "" {
+		return fmt.Errorf("%w: deliveries require a run ID", ErrConflict)
+	}
 	conv, err := getConversationTx(ctx, tx, item.RouteKey)
 	if err != nil {
 		return err
@@ -62,12 +70,21 @@ func planDeliveriesTx(ctx context.Context, tx *sql.Tx, item Item, plans []Delive
 	dest := conv.Route.Destination()
 	now := time.Now().UnixNano()
 	for _, p := range plans {
-		res, err := tx.ExecContext(ctx, `UPDATE deliveries SET desired_revision = ?, desired_text = ?, content_hash = ?, op_state = CASE WHEN remote_id = '' THEN op_state ELSE ? END, updated_at = ? WHERE run_id = ? AND chunk_index = ?`, p.Revision, p.Text, ContentHash(p.Text), OpEditPending, now, item.RunID, p.ChunkIndex)
+		// Revisions are monotonic: a planned revision never lowers a row.
+		// A row already acknowledged at a lower revision returns to pending.
+		res, err := tx.ExecContext(ctx, `UPDATE deliveries SET desired_revision = ?, desired_text = ?, content_hash = ?, op_state = CASE WHEN remote_id = '' THEN op_state ELSE ? END, status = CASE WHEN status = ? AND acked_revision <> ? THEN ? ELSE status END, updated_at = ? WHERE run_id = ? AND chunk_index = ? AND desired_revision <= ?`, p.Revision, p.Text, ContentHash(p.Text), OpEditPending, DeliveryAcked, p.Revision, DeliveryPending, now, item.RunID, p.ChunkIndex, p.Revision)
 		if err != nil {
 			return storageErr(err)
 		}
 		if n, _ := res.RowsAffected(); n == 1 {
 			continue
+		}
+		var exists int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM deliveries WHERE run_id = ? AND chunk_index = ?`, item.RunID, p.ChunkIndex).Scan(&exists); err != nil {
+			return storageErr(err)
+		}
+		if exists != 0 {
+			continue // an equal or newer revision is already planned
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO deliveries (route_key, generation, inbox_id, run_id, delivery_seq, chunk_index, platform, installation, channel, thread_root, desired_revision, desired_text, content_hash, status, op_state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			item.RouteKey, item.Generation, item.ID, item.RunID, item.Seq, p.ChunkIndex, dest.Platform, dest.Installation, dest.Channel, dest.ThreadRoot, p.Revision, p.Text, ContentHash(p.Text), DeliveryPending, OpPlanned, now, now); err != nil {
@@ -95,7 +112,7 @@ func (s *Store) PlanPreview(ctx context.Context, item Item, placeholder string) 
 // NextDelivery returns the lowest-ordered unresolved delivery of the route
 // and whether the lane is blocked by a failed or ambiguous predecessor.
 func (s *Store) NextDelivery(ctx context.Context, routeKey string) (Delivery, bool, error) {
-	d, err := scanDelivery(s.host.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d JOIN conversations c ON c.route_key = d.route_key WHERE d.route_key = ? AND NOT (d.status = ? AND d.acked_revision = d.desired_revision) ORDER BY d.delivery_seq, d.chunk_index LIMIT 1`, routeKey, DeliveryAcked))
+	d, err := scanDelivery(s.host.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d JOIN conversations c ON c.route_key = d.route_key WHERE d.route_key = ? AND `+qualify(unresolvedDelivery)+` ORDER BY d.delivery_seq, d.chunk_index LIMIT 1`, routeKey))
 	if err != nil {
 		return Delivery{}, false, err
 	}
@@ -114,14 +131,19 @@ func (s *Store) DeliveryForRun(ctx context.Context, runID string, chunk int) (De
 }
 
 // MarkCreateIntent persists the intent (and nonce) before a create call.
+// It refuses rows that already have a remote ID: once a create returned an
+// ID, no path may create again for that row.
 func (s *Store) MarkCreateIntent(ctx context.Context, id int64) (Delivery, error) {
 	var out Delivery
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
 		now := time.Now().UnixNano()
-		if _, err := tx.ExecContext(ctx, `UPDATE deliveries SET op_state = ?, nonce = CASE WHEN nonce = '' THEN ? ELSE nonce END, attempts = attempts + 1, first_attempt_at = CASE WHEN first_attempt_at = 0 THEN ? ELSE first_attempt_at END, updated_at = ? WHERE id = ? AND remote_id = ''`, OpCreateIntent, newNonce(), now, now, id); err != nil {
+		res, err := tx.ExecContext(ctx, `UPDATE deliveries SET op_state = ?, nonce = CASE WHEN nonce = '' THEN ? ELSE nonce END, attempts = attempts + 1, first_attempt_at = CASE WHEN first_attempt_at = 0 THEN ? ELSE first_attempt_at END, updated_at = ? WHERE id = ? AND remote_id = ''`, OpCreateIntent, newNonce(), now, now, id)
+		if err != nil {
 			return storageErr(err)
 		}
-		var err error
+		if n, _ := res.RowsAffected(); n != 1 {
+			return fmt.Errorf("%w: delivery %d already has a remote message", ErrConflict, id)
+		}
 		out, err = scanDelivery(tx.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d JOIN conversations c ON c.route_key = d.route_key WHERE d.id = ?`, id))
 		return err
 	})
@@ -166,17 +188,27 @@ func (s *Store) markAcked(ctx context.Context, id int64, remoteID string, acked 
 	})
 }
 
-// MarkAttempt records a retry schedule after a definite failure.
+// MarkAttempt records a retry schedule after a definite failure. A row
+// without a remote ID returns to the planned operation state so that a
+// create intent left behind by a crash can be told apart from a definite
+// failure.
 func (s *Store) MarkAttempt(ctx context.Context, id int64, retryAt time.Time) error {
 	now := time.Now().UnixNano()
-	_, err := s.host.ExecContext(ctx, `UPDATE deliveries SET attempts = attempts + 1, first_attempt_at = CASE WHEN first_attempt_at = 0 THEN ? ELSE first_attempt_at END, retry_at = ?, updated_at = ? WHERE id = ?`, now, retryAt.UnixNano(), now, id)
+	_, err := s.host.ExecContext(ctx, `UPDATE deliveries SET attempts = attempts + 1, first_attempt_at = CASE WHEN first_attempt_at = 0 THEN ? ELSE first_attempt_at END, retry_at = ?, op_state = CASE WHEN remote_id = '' THEN ? ELSE op_state END, updated_at = ? WHERE id = ?`, now, retryAt.UnixNano(), OpPlanned, now, id)
 	return storageErr(err)
 }
 
-// MarkAmbiguous records an unknown create outcome.
+// MarkAmbiguous records an unknown create outcome. It refuses rows that
+// already have a remote ID.
 func (s *Store) MarkAmbiguous(ctx context.Context, id int64) error {
-	_, err := s.host.ExecContext(ctx, `UPDATE deliveries SET status = ?, updated_at = ? WHERE id = ? AND remote_id = ''`, DeliveryAmbiguous, time.Now().UnixNano(), id)
-	return storageErr(err)
+	res, err := s.host.ExecContext(ctx, `UPDATE deliveries SET status = ?, updated_at = ? WHERE id = ? AND remote_id = ''`, DeliveryAmbiguous, time.Now().UnixNano(), id)
+	if err != nil {
+		return storageErr(err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return fmt.Errorf("%w: delivery %d has a remote message", ErrConflict, id)
+	}
+	return nil
 }
 
 // MarkFailed records a permanent delivery failure for operator resolution.
@@ -185,8 +217,8 @@ func (s *Store) MarkFailed(ctx context.Context, id int64, audit string) error {
 	return storageErr(err)
 }
 
-// SetDesired updates the desired text/revision of an existing row (used
-// when a run settles after its preview row exists).
+// SetDesired updates the desired text/revision of an existing row. It is a
+// diagnostic/test helper; production planning goes through MarkTerminal.
 func (s *Store) SetDesired(ctx context.Context, id int64, text string, revision int64) error {
 	_, err := s.host.ExecContext(ctx, `UPDATE deliveries SET desired_revision = ?, desired_text = ?, content_hash = ?, op_state = CASE WHEN remote_id = '' THEN op_state ELSE ? END, status = CASE WHEN status = ? THEN ? ELSE status END, updated_at = ? WHERE id = ?`, revision, text, ContentHash(text), OpEditPending, DeliveryAcked, DeliveryPending, time.Now().UnixNano(), id)
 	return storageErr(err)
@@ -194,7 +226,7 @@ func (s *Store) SetDesired(ctx context.Context, id int64, text string, revision 
 
 // ListDeliveries returns bounded rows for operator listing.
 func (s *Store) ListDeliveries(ctx context.Context, limit int) ([]Delivery, error) {
-	rows, err := s.host.QueryContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d JOIN conversations c ON c.route_key = d.route_key WHERE NOT (d.status = ? AND d.acked_revision = d.desired_revision) ORDER BY d.id LIMIT ?`, DeliveryAcked, limit)
+	rows, err := s.host.QueryContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d JOIN conversations c ON c.route_key = d.route_key WHERE `+qualify(unresolvedDelivery)+` ORDER BY d.id LIMIT ?`, limit)
 	if err != nil {
 		return nil, storageErr(err)
 	}
@@ -254,6 +286,13 @@ func (s *Store) Resend(ctx context.Context, id int64, audit string) error {
 // UnresolvedDeliveries counts rows that are not acknowledged at their desired revision.
 func (s *Store) UnresolvedDeliveries(ctx context.Context, routeKey string) (int, error) {
 	var n int
-	err := s.host.QueryRowContext(ctx, `SELECT COUNT(*) FROM deliveries WHERE route_key = ? AND NOT (status = ? AND acked_revision = desired_revision)`, routeKey, DeliveryAcked).Scan(&n)
+	err := s.host.QueryRowContext(ctx, `SELECT COUNT(*) FROM deliveries WHERE route_key = ? AND `+unresolvedDelivery, routeKey).Scan(&n)
 	return n, storageErr(err)
+}
+
+// qualify prefixes the unresolved predicate's columns with the deliveries
+// alias used in joined queries.
+func qualify(predicate string) string {
+	r := strings.NewReplacer("status", "d.status", "acked_revision", "d.acked_revision", "desired_revision", "d.desired_revision")
+	return r.Replace(predicate)
 }

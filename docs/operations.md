@@ -50,7 +50,7 @@ eino-channels delivery list --config config.json
 ```
 
 Lists unresolved rows: ID, platform, status, operation state, attempts,
-chunk index. Bodies are never printed.
+chunk index, destination channel and thread. Bodies are never printed.
 
 ```
 eino-channels delivery resolve --config config.json --id <id> \

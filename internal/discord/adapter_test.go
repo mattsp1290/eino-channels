@@ -1135,35 +1135,35 @@ func TestDiscordDeliveryAllowed(t *testing.T) {
 	d := h.a.Deliverer()
 
 	dmOK := state.Destination{Platform: state.PlatformDiscord, Installation: botID, DMActor: allowedUser}
-	if !d.Allowed(dmOK) {
+	if ok, _ := d.Allowed(context.Background(), dmOK); !ok {
 		t.Error("Allowed(dm allowed actor) = false, want true")
 	}
 	dmBad := state.Destination{Platform: state.PlatformDiscord, Installation: botID, DMActor: otherUser}
-	if d.Allowed(dmBad) {
+	if ok, _ := d.Allowed(context.Background(), dmBad); ok {
 		t.Error("Allowed(dm other actor) = true, want false")
 	}
 
 	okThread := "600000000000000020"
 	h.fake.addChannel(okThread, discordgo.ChannelTypeGuildPublicThread, guildID, textChanID)
 	destOK := state.Destination{Platform: state.PlatformDiscord, Installation: botID, Channel: okThread, ThreadRoot: guildID}
-	if !d.Allowed(destOK) {
+	if ok, _ := d.Allowed(context.Background(), destOK); !ok {
 		t.Error("Allowed(thread, allowed parent) = false, want true")
 	}
 
 	badThread := "600000000000000021"
 	h.fake.addChannel(badThread, discordgo.ChannelTypeGuildPublicThread, guildID, "999999999999999997")
 	destBadParent := state.Destination{Platform: state.PlatformDiscord, Installation: botID, Channel: badThread, ThreadRoot: guildID}
-	if d.Allowed(destBadParent) {
+	if ok, _ := d.Allowed(context.Background(), destBadParent); ok {
 		t.Error("Allowed(thread, disallowed parent) = true, want false")
 	}
 
 	destUnknownGuild := state.Destination{Platform: state.PlatformDiscord, Installation: botID, Channel: okThread, ThreadRoot: "999999999999999996"}
-	if d.Allowed(destUnknownGuild) {
+	if ok, _ := d.Allowed(context.Background(), destUnknownGuild); ok {
 		t.Error("Allowed(unknown guild) = true, want false")
 	}
 
 	destWrongInstall := state.Destination{Platform: state.PlatformDiscord, Installation: "999999999999999995", Channel: okThread, ThreadRoot: guildID}
-	if d.Allowed(destWrongInstall) {
+	if ok, _ := d.Allowed(context.Background(), destWrongInstall); ok {
 		t.Error("Allowed(wrong installation) = true, want false")
 	}
 }

@@ -180,6 +180,9 @@ type Disposition struct {
 	Item    Item
 	// Conversation is the route record at commit time.
 	Conversation Conversation
+	// StopNoop reports that a stop control found nothing running or queued
+	// and was completed on arrival.
+	StopNoop bool
 }
 
 // Outcome classifies ingestion.

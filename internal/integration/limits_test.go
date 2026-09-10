@@ -53,15 +53,14 @@ func TestHistoryLimitThenNew(t *testing.T) {
 	if n := len(provider.requests()); n != config.MaxHistoryTurns {
 		t.Fatalf("requests after limit=%d", n)
 	}
-	found := false
-	for _, n := range env.slack.Notices() {
-		if n == conversation.NoticeHistoryLimit {
-			found = true
+	testkit.Eventually(t, 20*time.Second, func() bool {
+		for _, n := range env.slack.Notices() {
+			if n == conversation.NoticeHistoryLimit {
+				return true
+			}
 		}
-	}
-	if !found {
-		t.Fatalf("notices=%q", env.slack.Notices())
-	}
+		return false
+	}, "history limit notice")
 	if resp := env.ingest(testkit.DM("D1", "U1", "9.001000", "!new")); resp.Outcome != state.OutcomeAccepted {
 		t.Fatalf("new=%+v", resp)
 	}

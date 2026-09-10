@@ -438,7 +438,7 @@ func TestLoadSecretsSlackRequiresBothTokens(t *testing.T) {
 	})
 
 	t.Run("missing app token only", func(t *testing.T) {
-		env := map[string]string{EnvOpenCodeAPIKey: "key", EnvSlackBotToken: "bot"}
+		env := map[string]string{EnvOpenCodeAPIKey: "key", EnvSlackBotToken: "xoxb-bot"}
 		_, err := LoadSecrets(cfg, getenvFromMap(env))
 		if err == nil {
 			t.Fatal("LoadSecrets() succeeded, want error")
@@ -468,8 +468,8 @@ func TestLoadSecretsSuccessAndTrimming(t *testing.T) {
 	cfg := Config{Slack: Slack{Enabled: true}, Discord: Discord{Enabled: true}}
 	env := map[string]string{
 		EnvOpenCodeAPIKey:  "  key \n",
-		EnvSlackBotToken:   "\tbotTok  ",
-		EnvSlackAppToken:   " appTok\n",
+		EnvSlackBotToken:   "\txoxb-botTok  ",
+		EnvSlackAppToken:   " xapp-appTok\n",
 		EnvDiscordBotToken: " discTok ",
 	}
 	s, err := LoadSecrets(cfg, getenvFromMap(env))
@@ -479,11 +479,11 @@ func TestLoadSecretsSuccessAndTrimming(t *testing.T) {
 	if s.OpenCodeAPIKey != "key" {
 		t.Errorf("OpenCodeAPIKey = %q, want %q", s.OpenCodeAPIKey, "key")
 	}
-	if s.SlackBotToken != "botTok" {
-		t.Errorf("SlackBotToken = %q, want %q", s.SlackBotToken, "botTok")
+	if s.SlackBotToken != "xoxb-botTok" {
+		t.Errorf("SlackBotToken = %q, want %q", s.SlackBotToken, "xoxb-botTok")
 	}
-	if s.SlackAppToken != "appTok" {
-		t.Errorf("SlackAppToken = %q, want %q", s.SlackAppToken, "appTok")
+	if s.SlackAppToken != "xapp-appTok" {
+		t.Errorf("SlackAppToken = %q, want %q", s.SlackAppToken, "xapp-appTok")
 	}
 	if s.DiscordBotToken != "discTok" {
 		t.Errorf("DiscordBotToken = %q, want %q", s.DiscordBotToken, "discTok")
@@ -592,4 +592,13 @@ func TestLoad(t *testing.T) {
 			t.Errorf("Load() error = %v, want errors.Is(err, ErrInvalid)", err)
 		}
 	})
+}
+
+func TestLoadSecretsSlackTokenPrefixes(t *testing.T) {
+	cfg := Config{Slack: Slack{Enabled: true}}
+	env := map[string]string{EnvOpenCodeAPIKey: "key", EnvSlackBotToken: "xapp-swapped", EnvSlackAppToken: "xoxb-swapped"}
+	_, err := LoadSecrets(cfg, getenvFromMap(env))
+	if err == nil || !strings.Contains(err.Error(), "xoxb-") || strings.Contains(err.Error(), "swapped") {
+		t.Fatalf("LoadSecrets() error = %v, want prefix guidance without the value", err)
+	}
 }

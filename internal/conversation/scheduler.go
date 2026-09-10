@@ -7,10 +7,10 @@ import (
 )
 
 const (
-	scheduleTick   = time.Second
-	routeBatch     = 64
-	parkBlocked    = 30 * time.Second
-	parkUnavailble = 15 * time.Second
+	scheduleTick    = time.Second
+	routeBatch      = 64
+	parkBlocked     = 30 * time.Second
+	parkUnavailable = 15 * time.Second
 )
 
 // scheduler spawns bounded route runners for routes that have work.
@@ -31,10 +31,17 @@ func (s *Service) scheduler() {
 		if closing {
 			return
 		}
-		keys, err := s.st.RoutesWithWork(s.ctx, routeBatch)
+		keys, err := s.st.RoutesWithWork(s.ctx, s.cursor, routeBatch)
+		if err == nil && len(keys) == 0 && s.cursor != "" {
+			s.cursor = ""
+			keys, err = s.st.RoutesWithWork(s.ctx, "", routeBatch)
+		}
 		if err != nil {
 			s.log.Warn("scheduler scan failed", "error", safeErr(err))
 			continue
+		}
+		if len(keys) != 0 {
+			s.cursor = keys[len(keys)-1]
 		}
 		now := time.Now()
 		for _, key := range keys {
@@ -54,17 +61,31 @@ func (s *Service) scheduler() {
 	}
 }
 
-// park delays rescheduling a route. A new ingest clears the park.
-func (s *Service) park(key string, d time.Duration) {
+// park delays rescheduling a route unless an ingest arrived for it since
+// the runner last observed the route (seen). It reports whether it parked.
+func (s *Service) park(key string, d time.Duration, seen uint64) bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ingests[key] != seen {
+		return false
+	}
 	s.parked[key] = time.Now().Add(d)
-	s.mu.Unlock()
+	return true
 }
 
+// unpark clears a park and bumps the ingest counter so a concurrent park
+// decision made on stale information is refused.
 func (s *Service) unpark(key string) {
 	s.mu.Lock()
 	delete(s.parked, key)
+	s.ingests[key]++
 	s.mu.Unlock()
+}
+
+func (s *Service) ingestSeq(key string) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ingests[key]
 }
 
 // runRoute processes one route until it is idle, parked or closing.
@@ -79,7 +100,7 @@ func (s *Service) runRoute(key string) {
 	conv, err := s.st.GetConversationByKey(s.ctx, key)
 	if err != nil {
 		s.log.Warn("route unavailable", "error", safeErr(err))
-		s.park(key, parkUnavailble)
+		s.park(key, parkUnavailable, s.ingestSeq(key))
 		return
 	}
 	for {
@@ -89,6 +110,7 @@ func (s *Service) runRoute(key string) {
 		if closing || s.ctx.Err() != nil {
 			return
 		}
+		seen := s.ingestSeq(key)
 		if current, err := s.st.GetConversationByKey(s.ctx, key); err == nil {
 			conv = current
 		}
@@ -106,8 +128,10 @@ func (s *Service) runRoute(key string) {
 				outcome = workDone
 			}
 			if outcome == workPark {
-				s.park(key, parkUnavailble)
-				return
+				if s.park(key, parkUnavailable, seen) {
+					return
+				}
+				continue
 			}
 			if outcome == workStop {
 				return
@@ -115,18 +139,27 @@ func (s *Service) runRoute(key string) {
 			continue
 		case !isNotFound(err):
 			s.log.Warn("next work failed", "error", safeErr(err))
-			s.park(key, parkUnavailble)
-			return
+			if s.park(key, parkUnavailable, seen) {
+				return
+			}
+			continue
 		}
 		// No inbox work: drain the delivery lane.
 		blocked, wait := s.drainDeliveries(&conv)
 		switch {
 		case blocked:
-			s.park(key, parkBlocked)
-			return
+			if s.park(key, parkBlocked, seen) {
+				return
+			}
+			continue
 		case wait > 0:
-			s.park(key, wait)
-			return
+			if s.park(key, wait, seen) {
+				return
+			}
+			continue
+		}
+		if s.ingestSeq(key) != seen {
+			continue // work arrived while draining
 		}
 		return
 	}

@@ -61,6 +61,10 @@ func Chunk(text string, budget int, measure Measure) []string {
 		return []string{text}
 	}
 	const fenceReserve = 12 // closing "\n```" plus reopening fence line
+	// A fence line longer than this share of the budget is not tracked as a
+	// fence: re-opening it in every chunk would let model output multiply
+	// the number of messages.
+	maxFence := budget / 4
 	var chunks []string
 	var cur strings.Builder
 	curLen := 0
@@ -90,8 +94,8 @@ func Chunk(text string, budget int, measure Measure) []string {
 			continue
 		}
 		limit := budget
-		if openFence != "" || isFence(line) {
-			limit = budget - fenceReserve - measure(openFence)
+		if openFence != "" || isFence(line) && measure(line) <= maxFence {
+			limit = max(budget-fenceReserve-measure(openFence), budget/2)
 		}
 		ll := measure(line)
 		if curLen+ll > limit && curLen > 0 {
@@ -110,10 +114,11 @@ func Chunk(text string, budget int, measure Measure) []string {
 			curLen += ll
 		}
 		if isFence(line) {
-			if openFence == "" {
-				openFence = strings.TrimRight(line, "\n")
-			} else {
+			switch {
+			case openFence != "":
 				openFence = ""
+			case measure(line) <= maxFence:
+				openFence = strings.TrimRight(line, "\n")
 			}
 		}
 	}

@@ -857,7 +857,7 @@ func TestRoutesWithWork(t *testing.T) {
 		t.Fatalf("MarkTerminal B: %v", err)
 	}
 
-	keys, err := st.RoutesWithWork(ctx, 10)
+	keys, err := st.RoutesWithWork(ctx, "", 10)
 	if err != nil {
 		t.Fatalf("RoutesWithWork: %v", err)
 	}
@@ -892,12 +892,12 @@ func TestPendingStopsRecoveryActiveItem(t *testing.T) {
 		t.Fatalf("Ingest stop: %v", err)
 	}
 
-	stops, err := st.PendingStops(ctx, route.Key())
-	if err != nil {
-		t.Fatalf("PendingStops: %v", err)
+	// A stop with nothing running or queued completes on arrival.
+	if !ds.StopNoop || ds.Item.State != StateComplete {
+		t.Fatalf("idle stop = %+v", ds)
 	}
-	if len(stops) != 1 || stops[0].ID != ds.Item.ID {
-		t.Fatalf("PendingStops = %+v, want [%d]", stops, ds.Item.ID)
+	if stops, err := st.PendingStops(ctx, route.Key()); err != nil || len(stops) != 0 {
+		t.Fatalf("PendingStops = %+v err = %v, want none", stops, err)
 	}
 
 	d, err := st.Ingest(ctx, promptInbound(route, "p1", "U1", "hi"), capacity)
@@ -1014,5 +1014,63 @@ func TestIngestConcurrentCapacityPerRoute(t *testing.T) {
 	}
 	if got != wantAccepted {
 		t.Fatalf("queued count = %d, want %d", got, wantAccepted)
+	}
+}
+
+// A preview row acknowledged at revision 0 and then planned to revision 1
+// must be visible to the scheduler scan after a restart.
+func TestPlannedFinalAfterAckedPreviewIsSchedulable(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	in := Inbound{Route: Route{Platform: PlatformSlack, Installation: "T1", Channel: "D7", DMActor: "U1"}, MessageID: "7.1", Actor: "U1", ActorLabel: "U1", Kind: KindPrompt, Content: "x", ReceivedAt: time.Now()}
+	d, err := st.Ingest(ctx, in, Capacity{MaxQueuedPerRoute: 8, MaxPendingGlobal: 256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Transition(ctx, d.Item.ID, StateQueued, StateAdmitting, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkAdmitted(ctx, d.Item.ID, "run-7", "u", "a"); err != nil {
+		t.Fatal(err)
+	}
+	item, _ := st.GetItem(ctx, d.Item.ID)
+	row, err := st.PlanPreview(ctx, item, "Thinking…")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.MarkCreateIntent(ctx, row.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkCreated(ctx, row.ID, "9.9", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.MarkTerminal(ctx, d.Item.ID, "completed", CodeCompleted, []DeliveryPlan{{ChunkIndex: 0, Text: "final", Revision: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.GetDelivery(ctx, row.ID)
+	if got.Status != DeliveryPending || got.Op != OpEditPending || got.DesiredRevision != 1 || got.AckedRevision != 0 {
+		t.Fatalf("row=%+v", got)
+	}
+	keys, err := st.RoutesWithWork(ctx, "", 10)
+	if err != nil || len(keys) != 1 || keys[0] != in.Route.Key() {
+		t.Fatalf("keys=%v err=%v", keys, err)
+	}
+	// Re-planning an older revision never lowers the row.
+	if err := st.MarkEdited(ctx, row.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PlanPreview(ctx, item, "Thinking…"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = st.GetDelivery(ctx, row.ID)
+	if got.DesiredRevision != 1 || !got.Resolved() {
+		t.Fatalf("revision lowered: %+v", got)
+	}
+	// A create intent can never be recorded again once a remote ID exists.
+	if _, err := st.MarkCreateIntent(ctx, row.ID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("intent after create: %v", err)
+	}
+	if err := st.MarkAmbiguous(ctx, row.ID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("ambiguous after create: %v", err)
 	}
 }

@@ -318,3 +318,41 @@ func TestPreviewLongTextTruncatedWithNotice(t *testing.T) {
 		t.Errorf("Preview() = %q, want suffix %q", got, ContinuationNotice)
 	}
 }
+
+// A model-controlled fence line must not multiply the number of chunks.
+func TestChunkOverlongFenceLineDoesNotAmplify(t *testing.T) {
+	budget := 1800
+	fence := "```" + strings.Repeat("x", 900) + "\n"
+	body := strings.Repeat("line of code\n", 400)
+	text := fence + body + "```\n"
+	chunks := Chunk(text, budget, DiscordMeasure)
+	total := 0
+	for _, c := range chunks {
+		if DiscordMeasure(c) > budget {
+			t.Fatalf("chunk over budget: %d", DiscordMeasure(c))
+		}
+		total += len(c)
+	}
+	if want := len(text)/budget + 2; len(chunks) > want*2 {
+		t.Fatalf("amplified: %d chunks for %d bytes", len(chunks), len(text))
+	}
+	if total > 2*len(text) {
+		t.Fatalf("output %d bytes for %d input bytes", total, len(text))
+	}
+	// Ordinary fences still balance and reopen, with a floor on the budget.
+	normal := "```go\n" + strings.Repeat("fmt.Println(1)\n", 300) + "```\n"
+	for _, c := range Chunk(normal, 200, SlackMeasure) {
+		if SlackMeasure(c) > 200 {
+			t.Fatalf("over budget: %d", SlackMeasure(c))
+		}
+		n := 0
+		for _, line := range strings.Split(strings.TrimRight(c, "\n"), "\n") {
+			if strings.HasPrefix(line, "```") {
+				n++
+			}
+		}
+		if n%2 != 0 {
+			t.Fatalf("unbalanced fence in chunk %q", c)
+		}
+	}
+}

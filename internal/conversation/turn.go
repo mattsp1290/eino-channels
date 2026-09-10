@@ -49,7 +49,10 @@ func (s *Service) runPrompt(conv *state.Conversation, item state.Item) workOutco
 	}
 	if item.Generation != conv.Generation {
 		// Accepted before a rotation could only happen through a bug; never run it.
-		_ = s.st.Transition(s.ctx, item.ID, "", state.StateCanceled, state.CodeCanceled)
+		if err := s.st.Transition(s.ctx, item.ID, "", state.StateCanceled, state.CodeCanceled); err != nil {
+			s.log.Error("cancel stale-generation item", "inbox", item.ID, "error", safeErr(err))
+			return workPark
+		}
 		return workDone
 	}
 	sessionID := session.ID(conv.RuntimeSessionID)
@@ -115,7 +118,7 @@ func (s *Service) runPrompt(conv *state.Conversation, item state.Item) workOutco
 	if stops, err := s.st.PendingStops(s.ctx, conv.Route.Key()); err == nil {
 		for _, st := range stops {
 			if st.StopTargetInboxID == item.ID || st.StopTargetRunID == item.RunID {
-				s.setStopFlag(conv.Route.Key())
+				s.setStopFlag(item.RunID)
 				ictx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 				_ = handle.Interrupt(ictx, "user stop")
 				cancel()
@@ -129,9 +132,11 @@ func (s *Service) runPrompt(conv *state.Conversation, item state.Item) workOutco
 	if result.Status == session.RunFailed {
 		s.log.Warn("run failed", "inbox", item.ID, "code", safeRunError(result.Error))
 	}
-	userStop := s.consumeStopFlag(conv.Route.Key())
+	userStop := s.consumeStopFlag(item.RunID)
 
 	// Phase 3: read committed text and plan deliveries.
+	// ok (finalized) matters only for completed runs; an interrupted run's
+	// placeholder is never finalized, so its committed text is empty.
 	text, ok, unavailable := s.committedText(sessionID, receipt.RunID)
 	final, code := composeFinal(result, text, ok, unavailable, proj.limitHit(), userStop, proj.liveText())
 	plans := make([]state.DeliveryPlan, 0, 4)
@@ -193,13 +198,26 @@ func (s *Service) admit(conv state.Conversation, item state.Item, dest state.Des
 				continue
 			}
 			s.log.Warn("admission attempt failed", "error", safeErr(err))
-			continue // loop performs the authoritative lookup before retrying
+			// Back off before the authoritative lookup and retry.
+			select {
+			case <-time.After(time.Duration(attempts) * time.Second):
+			case <-s.ctx.Done():
+				return session.AdmissionReceipt{}, nil, noop, workStop
+			}
+			continue
 		}
 		if err := s.st.MarkAdmitted(s.ctx, item.ID, string(res.Receipt.RunID), string(res.Receipt.UserMessageID), string(res.Receipt.AssistantMessageID)); err != nil {
 			s.log.Error("receipt persistence failed after admission", "error", safeErr(err))
 			// The run may be executing; recovery will find the receipt by key.
+			// Wait for it to settle, but never past shutdown.
 			if res.Handle != nil {
-				<-res.Handle.Done()
+				select {
+				case <-res.Handle.Done():
+				case <-s.ctx.Done():
+					ictx, icancel := context.WithTimeout(context.Background(), 5*time.Second)
+					_ = res.Handle.Interrupt(ictx, "service shutdown")
+					icancel()
+				}
 			}
 			cancel()
 			return session.AdmissionReceipt{}, nil, noop, workPark
@@ -317,9 +335,10 @@ func composeFinal(result runtime.Result, text string, ok, unavailable, limitHit,
 		if partial == "" {
 			partial = strings.TrimSpace(live)
 		}
+		partial = truncateUTF8(partial, config.MaxOutputBytes)
 		switch {
 		case limitHit:
-			return truncateUTF8(partial, config.MaxOutputBytes) + TextOutputLimit, state.CodeOutputLimit
+			return partial + TextOutputLimit, state.CodeOutputLimit
 		case userStop && partial != "":
 			return partial + TextStopped, state.CodeInterrupted
 		case userStop:
@@ -411,10 +430,19 @@ func (p *projection) wait() runtime.Result {
 
 func (p *projection) stop() {
 	p.cancel()
-	if p.sub != nil {
-		p.sub.Close()
+	p.mu.Lock()
+	sub := p.sub
+	p.mu.Unlock()
+	if sub != nil {
+		sub.Close()
 	}
 	p.wg.Wait()
+	// A resync may have swapped the subscription after the close above.
+	p.mu.Lock()
+	if p.sub != nil && p.sub != sub {
+		p.sub.Close()
+	}
+	p.mu.Unlock()
 }
 
 func (p *projection) limitHit() bool {
@@ -434,15 +462,25 @@ func (p *projection) consume() {
 	defer p.wg.Done()
 	runID := p.handle.RunID()
 	for {
-		u, err := p.sub.Next(p.ctx)
+		p.mu.Lock()
+		sub := p.sub
+		p.mu.Unlock()
+		u, err := sub.Next(p.ctx)
 		if err != nil {
 			if errors.Is(err, watch.ErrResyncRequired) && p.resyncs < maxWatchResyncs {
 				p.resyncs++
-				time.Sleep(time.Duration(p.resyncs) * 200 * time.Millisecond)
-				sub, werr := p.s.bridge.Watch(p.ctx, session.ID(p.conv.RuntimeSessionID))
+				select {
+				case <-time.After(time.Duration(p.resyncs) * 200 * time.Millisecond):
+				case <-p.ctx.Done():
+					return
+				}
+				fresh, werr := p.s.bridge.Watch(p.ctx, session.ID(p.conv.RuntimeSessionID))
 				if werr == nil {
-					p.sub.Close()
-					p.sub = sub
+					p.mu.Lock()
+					old := p.sub
+					p.sub = fresh
+					p.mu.Unlock()
+					old.Close()
 					continue
 				}
 			}
@@ -512,13 +550,20 @@ func (p *projection) flushLoop() {
 		if !dirty || row == nil || row.RemoteID == "" {
 			continue
 		}
+		if err := p.s.throttle(p.ctx, row.Destination); err != nil {
+			return
+		}
 		ctx, cancel := context.WithTimeout(p.ctx, p.s.platformTimeout())
 		err := p.deliverer.Edit(ctx, row.Destination, row.RemoteID, p.deliverer.Preview(text))
 		cancel()
 		if err != nil {
 			var de *DeliveryError
 			if errors.As(err, &de) && de.Kind == KindRateLimited && de.RetryAfter > 0 {
-				time.Sleep(min(de.RetryAfter, 30*time.Second))
+				select {
+				case <-time.After(min(de.RetryAfter, 30*time.Second)):
+				case <-p.ctx.Done():
+					return
+				}
 			}
 		}
 	}
@@ -539,8 +584,12 @@ func (p *projection) ensurePreviewRow() bool {
 	if row.RemoteID == "" {
 		// A create in flight must not be canceled by run completion: that is
 		// exactly the ambiguous case. Persistence after a create is never canceled.
-		created, ok := p.s.createDelivery(context.WithoutCancel(p.ctx), p.deliverer, row)
+		ok, _ := p.s.createDelivery(context.WithoutCancel(p.ctx), p.deliverer, row)
 		if !ok {
+			return false
+		}
+		created, err := p.s.st.GetDelivery(p.ctx, row.ID)
+		if err != nil || created.RemoteID == "" {
 			return false
 		}
 		row = created

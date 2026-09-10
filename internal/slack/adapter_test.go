@@ -364,14 +364,18 @@ func TestThreadFollowUp(t *testing.T) {
 		}))
 		h.adapter.HandleEvent(ctx, follow)
 
+		// Wait for the follow-up's committed reply, not its placeholder.
 		testkit.Eventually(t, 20*time.Second, func() bool {
-			return len(h.env.Deliverer.Messages()) >= 2
+			n := 0
+			for _, m := range h.env.Deliverer.Messages() {
+				if strings.Contains(m, "reply:") {
+					n++
+				}
+			}
+			return n >= 2 && len(h.env.Script.Requests()) >= 2
 		}, "follow-up delivered")
 
 		reqs := h.env.Script.Requests()
-		if len(reqs) < 2 {
-			t.Fatalf("Requests() len = %d, want >= 2", len(reqs))
-		}
 		userCount := 0
 		for _, m := range reqs[1].Messages {
 			if m.Role == einoschema.User {
@@ -755,38 +759,43 @@ func TestDeliverySeam(t *testing.T) {
 	})
 
 	t.Run("allowed dm actor", func(t *testing.T) {
-		if !d.Allowed(state.Destination{Platform: state.PlatformSlack, Installation: "T1", DMActor: "U1"}) {
+		if ok, _ := d.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T1", DMActor: "U1"}); !ok {
 			t.Error("expected allowed for DMActor U1")
 		}
-		if d.Allowed(state.Destination{Platform: state.PlatformSlack, Installation: "T1", DMActor: "U9"}) {
+		if ok, _ := d.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T1", DMActor: "U9"}); ok {
 			t.Error("expected denied for DMActor U9")
 		}
 	})
 
 	t.Run("allowed channel", func(t *testing.T) {
-		if !d.Allowed(state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "C1"}) {
+		if ok, _ := d.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "C1"}); !ok {
 			t.Error("expected allowed for channel C1")
 		}
-		if d.Allowed(state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "C9"}) {
+		if ok, _ := d.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "C9"}); ok {
 			t.Error("expected denied for channel C9")
 		}
 	})
 
 	t.Run("allowed wrong team", func(t *testing.T) {
-		if d.Allowed(state.Destination{Platform: state.PlatformSlack, Installation: "T2", Channel: "C1"}) {
+		if ok, _ := d.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T2", Channel: "C1"}); ok {
 			t.Error("expected denied for wrong team")
 		}
 	})
 
-	t.Run("allowed false after invalid auth", func(t *testing.T) {
+	t.Run("allowed unaffected by socket auth health", func(t *testing.T) {
 		h2 := newHarness(t)
 		d2 := h2.adapter.Deliverer()
-		if !d2.Allowed(state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "C1"}) {
+		if ok, _ := d2.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "C1"}); !ok {
 			t.Fatal("expected allowed before invalid auth")
 		}
 		h2.adapter.HandleEvent(ctx, socketmode.Event{Type: socketmode.EventTypeInvalidAuth})
-		if d2.Allowed(state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "C1"}) {
-			t.Error("expected denied after invalid auth event (unhealthy)")
+		if h2.adapter.Healthy() {
+			t.Error("expected unhealthy after invalid auth event")
+		}
+		// Web API delivery is independent of Socket Mode health: stored
+		// output must not be failed permanently by a transport blip.
+		if ok, _ := d2.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "C1"}); !ok {
+			t.Error("expected still allowed after invalid auth event")
 		}
 	})
 }

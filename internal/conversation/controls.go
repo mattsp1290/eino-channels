@@ -1,7 +1,6 @@
 package conversation
 
 import (
-	"context"
 	"errors"
 	"time"
 
@@ -50,10 +49,15 @@ func (s *Service) settleStop(conv state.Conversation, ctl state.Item) workOutcom
 			}
 		}
 	}
-	if err := s.st.Transition(s.ctx, ctl.ID, state.StatePending, state.StateComplete, ""); err != nil && !errors.Is(err, state.ErrConflict) {
+	err := s.st.Transition(s.ctx, ctl.ID, state.StatePending, state.StateComplete, "")
+	switch {
+	case err == nil:
+		s.Notify(conv.Route.Destination(), NoticeStopped)
+	case errors.Is(err, state.ErrConflict):
+		// Already completed by an earlier replay: no second notice.
+	default:
 		return workPark
 	}
-	s.Notify(conv.Route.Destination(), NoticeStopped)
 	return workDone
 }
 
@@ -93,5 +97,3 @@ func (s *Service) settleRun(target state.Item) workOutcome {
 		}
 	}
 }
-
-var _ = context.Background

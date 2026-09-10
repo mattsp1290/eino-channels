@@ -49,7 +49,7 @@ func TestVersionAndUsage(t *testing.T) {
 
 func TestCheckConfigNeverPrintsSecrets(t *testing.T) {
 	cfg := writeConfig(t, filepath.Join(t.TempDir(), "state"))
-	secrets := map[string]string{"OPENCODE_API_KEY": "SENTINEL_OC", "SLACK_BOT_TOKEN": "SENTINEL_SB", "SLACK_APP_TOKEN": "SENTINEL_SA", "DISCORD_BOT_TOKEN": "SENTINEL_DB"}
+	secrets := map[string]string{"OPENCODE_API_KEY": "SENTINEL_OC", "SLACK_BOT_TOKEN": "xoxb-SENTINEL_SB", "SLACK_APP_TOKEN": "xapp-SENTINEL_SA", "DISCORD_BOT_TOKEN": "SENTINEL_DB"}
 	code, out, errb := run([]string{"check-config", "--config", cfg}, env(secrets))
 	if code != 0 || !strings.Contains(out, "ok") || !strings.Contains(out, "credentials: present") {
 		t.Fatalf("code=%d out=%q err=%q", code, out, errb)
@@ -120,7 +120,7 @@ func seedDeliveries(t *testing.T, dir string) (slackID, discordID int64) {
 func TestDeliveryListAndResolve(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "state")
 	cfg := writeConfig(t, dir)
-	secrets := env(map[string]string{"OPENCODE_API_KEY": "k", "SLACK_BOT_TOKEN": "b", "SLACK_APP_TOKEN": "a", "DISCORD_BOT_TOKEN": "SENTINEL_DTOKEN"})
+	secrets := env(map[string]string{"OPENCODE_API_KEY": "k", "SLACK_BOT_TOKEN": "xoxb-b", "SLACK_APP_TOKEN": "xapp-a", "DISCORD_BOT_TOKEN": "SENTINEL_DTOKEN"})
 	slackID, discordID := seedDeliveries(t, dir)
 
 	code, out, errb := run([]string{"delivery", "list", "--config", cfg}, secrets)
@@ -208,7 +208,7 @@ func TestServeRejectsSecondInstanceAndBadState(t *testing.T) {
 	}
 	defer func() { _ = held.Close() }()
 	cfg := writeConfig(t, dir)
-	secrets := env(map[string]string{"OPENCODE_API_KEY": "k", "SLACK_BOT_TOKEN": "b", "SLACK_APP_TOKEN": "a", "DISCORD_BOT_TOKEN": "d"})
+	secrets := env(map[string]string{"OPENCODE_API_KEY": "k", "SLACK_BOT_TOKEN": "xoxb-b", "SLACK_APP_TOKEN": "xapp-a", "DISCORD_BOT_TOKEN": "d"})
 	code, _, errb := run([]string{"serve", "--config", cfg}, secrets)
 	if code != 1 || !strings.Contains(errb, "locked") {
 		t.Fatalf("code=%d err=%q", code, errb)

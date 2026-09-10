@@ -484,3 +484,75 @@ func TestPreviewEditsThenFinal(t *testing.T) {
 		t.Fatalf("creates=%d", creates)
 	}
 }
+
+// A preview acknowledged in one process and finalized before restart is
+// edited to the committed answer by the scheduler in the next process.
+func TestRestartDrivesFinalEditAfterAckedPreview(t *testing.T) {
+	dir := t.TempDir()
+	script := testkit.NewScript()
+	d := testkit.NewDeliverer(3500)
+	started, block := make(chan struct{}), make(chan struct{})
+	script.Push(testkit.Behavior{Reply: []string{"slow ", "answer"}, Started: started, Block: block})
+	env := testkit.Open(t, testkit.Options{Dir: dir, Script: script, Deliverer: d, Started: true})
+	r := env.Ingest(testkit.DM("D1", "U1", "11.000001", "go"))
+	<-started
+	testkit.Eventually(t, wait, func() bool { return d.Text("m1") != "" }, "preview created")
+	// Fail every edit so the final revision stays pending in this process.
+	d.FailEdit = func(string, string) error {
+		return &conversation.DeliveryError{Kind: conversation.KindDefinite, Err: errors.New("edit failed")}
+	}
+	close(block)
+	testkit.Eventually(t, wait, func() bool {
+		it, _ := env.Store.GetItem(context.Background(), r.Item.ID)
+		return it.State == state.StateTerminal
+	}, "terminal")
+	env.Close()
+	d.FailEdit = nil
+	env = testkit.Open(t, testkit.Options{Dir: dir, Script: script, Deliverer: d, Started: true})
+	defer env.Close()
+	texts := env.WaitDelivered(r.Item.ID, wait)
+	if texts[0] != "slow answer" || d.Text("m1") != "slow answer" {
+		t.Fatalf("final=%q m1=%q", texts, d.Text("m1"))
+	}
+	creates := 0
+	for _, c := range d.Calls() {
+		if c.Op == "create" {
+			creates++
+		}
+	}
+	if creates != 1 || len(script.Requests()) != 1 {
+		t.Fatalf("creates=%d requests=%d", creates, len(script.Requests()))
+	}
+}
+
+// A stop frozen against an item that is still admitting resolves the
+// receipt first and never starts a run that has no receipt.
+func TestStopAgainstAdmittingTarget(t *testing.T) {
+	dir := t.TempDir()
+	script := testkit.NewScript()
+	env := testkit.Open(t, testkit.Options{Dir: dir, Script: script})
+	r := env.Ingest(testkit.DM("D1", "U1", "12.000001", "never started"))
+	if err := env.Store.Transition(context.Background(), r.Item.ID, state.StateQueued, state.StateAdmitting, ""); err != nil {
+		t.Fatal(err)
+	}
+	stop := env.Ingest(testkit.DM("D1", "U1", "12.000002", "!stop"))
+	if stop.Item.StopTargetInboxID != r.Item.ID || stop.Notice != "" {
+		t.Fatalf("stop=%+v", stop)
+	}
+	env.Close()
+	env = testkit.Open(t, testkit.Options{Dir: dir, Script: script, Started: true})
+	defer env.Close()
+	testkit.Eventually(t, wait, func() bool {
+		it, _ := env.Store.GetItem(context.Background(), r.Item.ID)
+		ctl, _ := env.Store.GetItem(context.Background(), stop.Item.ID)
+		return it.State == state.StateCanceled && ctl.State == state.StateComplete
+	}, "target canceled without starting; control complete")
+	if n := len(script.Requests()); n != 0 {
+		t.Fatalf("provider requests=%d", n)
+	}
+	// Stop on an idle route reports nothing to do and completes on arrival.
+	idle := env.Ingest(testkit.DM("D1", "U1", "12.000003", "!stop"))
+	if idle.Notice != conversation.NoticeNothingToDo || idle.Item.State != state.StateComplete {
+		t.Fatalf("idle stop=%+v", idle)
+	}
+}

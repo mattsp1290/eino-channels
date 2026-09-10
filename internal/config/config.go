@@ -129,8 +129,8 @@ func (Secrets) MarshalJSON() ([]byte, error) { return []byte(`"<redacted>"`), ni
 var ErrInvalid = errors.New("invalid configuration")
 
 var (
-	slackTeamRe    = regexp.MustCompile(`^[TE][A-Z0-9]{2,}$`)
-	slackChannelRe = regexp.MustCompile(`^[CDG][A-Z0-9]{2,}$`)
+	slackTeamRe    = regexp.MustCompile(`^T[A-Z0-9]{2,}$`)
+	slackChannelRe = regexp.MustCompile(`^[CG][A-Z0-9]{2,}$`)
 	slackUserRe    = regexp.MustCompile(`^[UW][A-Z0-9]{2,}$`)
 	snowflakeRe    = regexp.MustCompile(`^[0-9]{15,22}$`)
 )
@@ -281,9 +281,13 @@ func LoadSecrets(cfg Config, getenv func(string) string) (Secrets, error) {
 		s.SlackAppToken = strings.TrimSpace(getenv(EnvSlackAppToken))
 		if s.SlackBotToken == "" {
 			missing = append(missing, EnvSlackBotToken)
+		} else if !strings.HasPrefix(s.SlackBotToken, "xoxb-") {
+			return Secrets{}, fmt.Errorf("%w: %s must be a bot token (xoxb-…)", ErrInvalid, EnvSlackBotToken)
 		}
 		if s.SlackAppToken == "" {
 			missing = append(missing, EnvSlackAppToken)
+		} else if !strings.HasPrefix(s.SlackAppToken, "xapp-") {
+			return Secrets{}, fmt.Errorf("%w: %s must be an app-level token (xapp-…)", ErrInvalid, EnvSlackAppToken)
 		}
 	}
 	if cfg.Discord.Enabled {

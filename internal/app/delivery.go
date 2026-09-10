@@ -75,9 +75,9 @@ func deliveryList(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "listing failed:", err.Error())
 		return 1
 	}
-	fmt.Fprintf(stdout, "%-8s %-8s %-18s %-14s %-9s %-9s\n", "ID", "PLATFORM", "STATUS", "OP", "ATTEMPTS", "CHUNK")
+	fmt.Fprintf(stdout, "%-8s %-8s %-18s %-14s %-9s %-6s %-22s %s\n", "ID", "PLATFORM", "STATUS", "OP", "ATTEMPTS", "CHUNK", "CHANNEL", "THREAD")
 	for _, d := range rows {
-		fmt.Fprintf(stdout, "%-8d %-8s %-18s %-14s %-9d %-9d\n", d.ID, d.Destination.Platform, d.Status, d.Op, d.Attempts, d.ChunkIndex)
+		fmt.Fprintf(stdout, "%-8d %-8s %-18s %-14s %-9d %-6d %-22s %s\n", d.ID, d.Destination.Platform, d.Status, d.Op, d.Attempts, d.ChunkIndex, d.Destination.Channel, d.Destination.ThreadRoot)
 	}
 	return 0
 }

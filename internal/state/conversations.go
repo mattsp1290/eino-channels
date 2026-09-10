@@ -112,7 +112,7 @@ func routeBusyTx(ctx context.Context, tx *sql.Tx, key string) (bool, error) {
 	if n != 0 {
 		return true, nil
 	}
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM deliveries WHERE route_key = ? AND NOT (status = ? AND acked_revision = desired_revision)`, key, DeliveryAcked).Scan(&n); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM deliveries WHERE route_key = ? AND `+unresolvedDelivery, key).Scan(&n); err != nil {
 		return false, storageErr(err)
 	}
 	return n != 0, nil

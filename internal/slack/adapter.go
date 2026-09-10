@@ -26,12 +26,11 @@ import (
 
 // Options configure the adapter.
 type Options struct {
-	Config    config.Slack
-	BotToken  string
-	AppToken  string
-	Service   *conversation.Service
-	Logger    *slog.Logger
-	UserAgent string
+	Config   config.Slack
+	BotToken string
+	AppToken string
+	Service  *conversation.Service
+	Logger   *slog.Logger
 	// APIURL and HTTPClient are test seams for a fake Web API.
 	APIURL     string
 	HTTPClient *http.Client
@@ -51,7 +50,6 @@ type Adapter struct {
 	deadline time.Duration
 
 	botUserID string
-	teamID    string
 	mention   *regexp.Regexp
 	healthy   atomic.Bool
 }
@@ -59,7 +57,7 @@ type Adapter struct {
 // New builds the adapter without network calls.
 func New(opts Options) (*Adapter, error) {
 	if opts.BotToken == "" || opts.AppToken == "" {
-		return nil, errors.New("slack: service and tokens required")
+		return nil, errors.New("slack: bot and app tokens required")
 	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
@@ -102,8 +100,8 @@ func (a *Adapter) Identity(ctx context.Context) error {
 	return nil
 }
 
-func (a *Adapter) setIdentity(teamID, botUserID string) {
-	a.teamID, a.botUserID = teamID, botUserID
+func (a *Adapter) setIdentity(_, botUserID string) {
+	a.botUserID = botUserID
 	a.mention = regexp.MustCompile(`<@` + regexp.QuoteMeta(botUserID) + `(\|[^>]*)?>`)
 	a.healthy.Store(true)
 }
@@ -179,7 +177,7 @@ func (a *Adapter) handleEventsAPI(ctx context.Context, payload slackevents.Event
 	if payload.Type != slackevents.CallbackEvent || payload.TeamID != a.cfg.TeamID {
 		return true
 	}
-	if cb, ok := payload.Data.(*slackevents.EventsAPICallbackEvent); ok && cb.IsExtSharedChannel {
+	if cb, ok := payload.Data.(*slackevents.EventsAPICallbackEvent); payload.IsExtSharedChannel || ok && cb.IsExtSharedChannel {
 		return true
 	}
 	in, ok := a.normalize(payload.InnerEvent)
@@ -296,15 +294,16 @@ func (d *Deliverer) Reconcile(context.Context, state.Destination, string) (strin
 	return "", false, nil
 }
 
-// Allowed rechecks the destination against the allowlists.
-func (d *Deliverer) Allowed(dest state.Destination) bool {
-	if dest.Platform != state.PlatformSlack || dest.Installation != d.a.cfg.TeamID || !d.a.Healthy() {
-		return false
+// Allowed rechecks the destination against the allowlists. Socket Mode
+// health is not authorization: Web API delivery is independent of it.
+func (d *Deliverer) Allowed(_ context.Context, dest state.Destination) (bool, error) {
+	if dest.Platform != state.PlatformSlack || dest.Installation != d.a.cfg.TeamID {
+		return false, nil
 	}
 	if dest.DMActor != "" {
-		return d.a.users.Contains(dest.DMActor)
+		return d.a.users.Contains(dest.DMActor), nil
 	}
-	return d.a.channels.Contains(dest.Channel)
+	return d.a.channels.Contains(dest.Channel), nil
 }
 
 // Notify posts a transient notice.
@@ -340,10 +339,9 @@ func classify(err error, create bool) error {
 		}
 		return &conversation.DeliveryError{Kind: conversation.KindDefinite, Err: errors.New("slack: " + api.Err)}
 	}
-	if errors.Is(err, context.Canceled) {
-		return &conversation.DeliveryError{Kind: conversation.KindDefinite, Err: err}
-	}
 	if create {
+		// Cancellation or a transport failure after a create was sent does
+		// not prove Slack never processed it; Slack has no nonce to check.
 		return &conversation.DeliveryError{Kind: conversation.KindAmbiguous, Err: errors.New("slack: transport failure")}
 	}
 	return &conversation.DeliveryError{Kind: conversation.KindDefinite, Err: errors.New("slack: transport failure")}

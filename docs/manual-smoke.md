@@ -21,19 +21,25 @@ explicit authorization before sending live bot messages to other people.
 
 | Case | Slack | Discord |
 | --- | --- | --- |
-| Short answer with a nonce | not run | pass |
-| Follow-up referring to the nonce | not run | pass |
-| Restart, then a reference question | not run | pass |
-| Preview edit visible during a long answer | not run | pass |
-| `!stop` then continue | not run | pass |
-| Long Unicode / code-fence answer, chunk order | not run | pass |
-| Thread vs DM isolation | not run | pass |
-| `!help`, `!new`, denied actor | not run | pass (`!help`, `!new`); denied actor not run |
+| Short answer with a nonce | pass | pass |
+| Follow-up referring to the nonce | pass | pass |
+| Restart, then a reference question | pass | pass |
+| Preview edit visible during a long answer | pass | pass |
+| `!stop` then continue | pass | pass |
+| Long Unicode / code-fence answer, chunk order | pass (escaping and Unicode confirmed visually by the operator) | pass |
+| Thread vs DM isolation | pass | pass |
+| `!help`, `!new`, denied actor | pass (`!help`, `!new`); denied actor not run | pass (`!help`, `!new`); denied actor not run |
 | One platform disconnected, other continues | not run | not applicable (single platform enabled) |
-| Effective permissions/intents, no mention notifications | not run | pass |
-| Flash accepts no-tools multi-turn history across restart | not run | pass |
+| Effective permissions/intents, no mention notifications | pass | pass |
+| Flash accepts no-tools multi-turn history across restart | pass | pass |
 
-Status: Discord half executed on 2026-09-10 against one operator-managed
+Status: both platforms executed on 2026-09-10. Slack ran against an app
+created and installed from `slack-manifest.json` with the Slack CLI
+(`slack platform run` supplied the bot and app-level tokens to a start hook
+that execs `serve`); one DM and two public-channel threads were used, a
+600-word answer delivered as two ordered chunks, `!stop` settled the essay
+interrupted, `!new` rotated the generation, and the service log recorded no
+warnings. The one-platform-disconnect case was not run. Discord half executed on 2026-09-10 against one operator-managed
 test installation (DM plus one public thread in one allowed text channel);
 every case passed. Observations: the placeholder edited in place while
 streaming; a 600-word answer with a Python block delivered as three ordered
@@ -42,8 +48,6 @@ every bot message carried empty allowed mentions and suppressed embeds;
 restart preserved the DM conversation; `!stop` settled the run interrupted
 with the stopped notice; `!new` rotated the generation and the follow-up ran
 on a fresh session; the service log recorded no warnings. Denied-actor was
-not run (no second participant available). Slack is not run: the test
-workspace app has no app-level (Socket Mode) token, lacks `im:history`, and
-has no `app_mention`/`message.im` event subscriptions yet. Failure of the
+not run (no second participant available). Failure of the
 live eligibility, model or protocol gate blocks release and identifies the
 provider owner; it does not authorize a fallback provider or model.

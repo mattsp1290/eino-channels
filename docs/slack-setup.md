@@ -26,3 +26,25 @@ Behavior:
   lost prompt. Retries are deduplicated by channel and timestamp.
 
 Not included: `chat:write.public`, user tokens, OAuth or distribution.
+
+## Creating the app with the Slack CLI
+
+The manifest can be applied without the web UI. In a scratch directory
+outside the repository:
+
+```
+mkdir -p .slack && cp /path/to/slack-manifest.json manifest.json
+cat > .slack/hooks.json <<'HOOKS'
+{"hooks": {"get-manifest": "./get-manifest.sh", "start": "./start.sh"},
+ "config": {"manifest": {"source": "local"}, "sdk-managed-connection-enabled": true}}
+HOOKS
+printf '#!/bin/sh\ncat "$(dirname "$0")/manifest.json"\n' > get-manifest.sh
+chmod +x get-manifest.sh
+slack manifest validate
+slack app install --team <TEAM_ID> --environment local
+```
+
+`slack platform run` then starts `start.sh` with `SLACK_BOT_TOKEN` and
+`SLACK_APP_TOKEN` in its environment; a start hook that exports the other
+credentials and execs `eino-channels serve --config config.json` runs the
+service without ever writing the tokens to disk. Never echo those variables.

@@ -9,9 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -31,87 +29,8 @@ import (
 	"github.com/mattsp1290/eino-channels/internal/testkit"
 )
 
-// --- fake Slack Web API ---------------------------------------------------
-
-type fakeCall struct {
-	Path string
-	Form url.Values
-}
-
-type fakeResp struct {
-	status     int
-	ok         bool
-	errCode    string
-	retryAfter string
-	hang       bool
-	ts         string
-}
-
-type fakeSlack struct {
-	mu sync.Mutex
-
-	authTeamID string
-	authUserID string
-	authBotID  string
-	authOK     bool
-
-	calls       []fakeCall
-	postQueue   []fakeResp
-	updateQueue []fakeResp
-	tsCounter   int
-}
-
 func newFakeSlack(teamID, userID, botID string, ok bool) *fakeSlack {
 	return &fakeSlack{authTeamID: teamID, authUserID: userID, authBotID: botID, authOK: ok}
-}
-
-func (f *fakeSlack) queuePost(r fakeResp) {
-	f.mu.Lock()
-	f.postQueue = append(f.postQueue, r)
-	f.mu.Unlock()
-}
-func (f *fakeSlack) queueUpdate(r fakeResp) {
-	f.mu.Lock()
-	f.updateQueue = append(f.updateQueue, r)
-	f.mu.Unlock()
-}
-
-func (f *fakeSlack) Calls() []fakeCall {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]fakeCall(nil), f.calls...)
-}
-
-func (f *fakeSlack) lastCall(path string) (fakeCall, bool) {
-	calls := f.Calls()
-	for i := len(calls) - 1; i >= 0; i-- {
-		if calls[i].Path == path {
-			return calls[i], true
-		}
-	}
-	return fakeCall{}, false
-}
-
-func (f *fakeSlack) nextTS() string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.tsCounter++
-	return fmt.Sprintf("1700000%03d.000100", f.tsCounter)
-}
-
-func (f *fakeSlack) nextResp(isCreate bool) (fakeResp, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	q := &f.postQueue
-	if !isCreate {
-		q = &f.updateQueue
-	}
-	if len(*q) == 0 {
-		return fakeResp{}, false
-	}
-	resp := (*q)[0]
-	*q = (*q)[1:]
-	return resp, true
 }
 
 func writeJSON(w http.ResponseWriter, status int, body map[string]any) {
@@ -119,80 +38,6 @@ func writeJSON(w http.ResponseWriter, status int, body map[string]any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
 }
-
-func (f *fakeSlack) handler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		path := strings.TrimPrefix(r.URL.Path, "/")
-		f.mu.Lock()
-		f.calls = append(f.calls, fakeCall{Path: path, Form: r.Form})
-		f.mu.Unlock()
-
-		switch path {
-		case "auth.test":
-			f.mu.Lock()
-			ok, team, user, bot := f.authOK, f.authTeamID, f.authUserID, f.authBotID
-			f.mu.Unlock()
-			body := map[string]any{"ok": ok, "team_id": team, "user_id": user, "bot_id": bot}
-			if !ok {
-				body["error"] = "invalid_auth"
-			}
-			writeJSON(w, http.StatusOK, body)
-		case "chat.postMessage":
-			f.respond(w, r, true)
-		case "chat.update":
-			f.respond(w, r, false)
-		default:
-			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-		}
-	})
-}
-
-func (f *fakeSlack) respond(w http.ResponseWriter, r *http.Request, isCreate bool) {
-	resp, has := f.nextResp(isCreate)
-	if !has {
-		resp = fakeResp{ok: true}
-	}
-	if resp.hang {
-		select {
-		case <-r.Context().Done():
-		case <-time.After(10 * time.Second):
-		}
-		return
-	}
-	if resp.status == http.StatusTooManyRequests {
-		if resp.retryAfter != "" {
-			w.Header().Set("Retry-After", resp.retryAfter)
-		}
-		w.WriteHeader(http.StatusTooManyRequests)
-		return
-	}
-	status := resp.status
-	if status == 0 {
-		status = http.StatusOK
-	}
-	body := map[string]any{"ok": resp.ok}
-	if resp.ok {
-		ts := resp.ts
-		if ts == "" {
-			if isCreate {
-				ts = f.nextTS()
-			} else {
-				ts = r.Form.Get("ts")
-			}
-		}
-		body["channel"] = r.Form.Get("channel")
-		body["ts"] = ts
-	} else {
-		body["error"] = resp.errCode
-	}
-	writeJSON(w, status, body)
-}
-
-// --- harness ---------------------------------------------------------------
 
 type harness struct {
 	env     *testkit.Env
@@ -776,25 +621,25 @@ func TestDeliverySeam(t *testing.T) {
 	})
 
 	t.Run("allowed dm actor", func(t *testing.T) {
-		if ok, _ := d.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T1", DMActor: "U1"}); !ok {
+		if ok, _ := d.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "D1"}, "U1"); !ok {
 			t.Error("expected allowed for DMActor U1")
 		}
-		if ok, _ := d.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T1", DMActor: "U9"}); ok {
+		if ok, _ := d.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "D1"}, "U9"); ok {
 			t.Error("expected denied for DMActor U9")
 		}
 	})
 
 	t.Run("allowed channel", func(t *testing.T) {
-		if ok, _ := d.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "C1"}); !ok {
+		if ok, _ := d.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "C1"}, ""); !ok {
 			t.Error("expected allowed for channel C1")
 		}
-		if ok, _ := d.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "C9"}); ok {
+		if ok, _ := d.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "C9"}, ""); ok {
 			t.Error("expected denied for channel C9")
 		}
 	})
 
 	t.Run("allowed wrong team", func(t *testing.T) {
-		if ok, _ := d.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T2", Channel: "C1"}); ok {
+		if ok, _ := d.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T2", Channel: "C1"}, ""); ok {
 			t.Error("expected denied for wrong team")
 		}
 	})
@@ -802,7 +647,7 @@ func TestDeliverySeam(t *testing.T) {
 	t.Run("allowed unaffected by socket auth health", func(t *testing.T) {
 		h2 := newHarness(t)
 		d2 := h2.adapter.Deliverer()
-		if ok, _ := d2.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "C1"}); !ok {
+		if ok, _ := d2.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "C1"}, ""); !ok {
 			t.Fatal("expected allowed before invalid auth")
 		}
 		h2.adapter.HandleEvent(ctx, socketmode.Event{Type: socketmode.EventTypeInvalidAuth})
@@ -811,7 +656,7 @@ func TestDeliverySeam(t *testing.T) {
 		}
 		// Web API delivery is independent of Socket Mode health: stored
 		// output must not be failed permanently by a transport blip.
-		if ok, _ := d2.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "C1"}); !ok {
+		if ok, _ := d2.Allowed(context.Background(), state.Destination{Platform: state.PlatformSlack, Installation: "T1", Channel: "C1"}, ""); !ok {
 			t.Error("expected still allowed after invalid auth event")
 		}
 	})

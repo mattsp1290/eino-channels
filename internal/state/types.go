@@ -43,21 +43,23 @@ func (r Route) Key() string {
 	return b.String()
 }
 
-// Destination is the immutable delivery target of a route.
+// Destination is the immutable delivery address of a route. Authorization
+// subjects (the DM actor) are not part of the address; see Route.Subject.
 type Destination struct {
 	Platform     Platform
 	Installation string
 	Channel      string
 	ThreadRoot   string
-	// DMActor is carried for allowlist rechecks only; it is not part of the
-	// delivery address.
-	DMActor string
 }
 
-// Destination returns the delivery target for the route.
+// Destination returns the delivery address for the route.
 func (r Route) Destination() Destination {
-	return Destination{Platform: r.Platform, Installation: r.Installation, Channel: r.Channel, ThreadRoot: r.ThreadRoot, DMActor: r.DMActor}
+	return Destination{Platform: r.Platform, Installation: r.Installation, Channel: r.Channel, ThreadRoot: r.ThreadRoot}
 }
+
+// Subject returns the actor that authorization rechecks use for a private
+// route, or "" for a shared route.
+func (r Route) Subject() string { return r.DMActor }
 
 // Conversation is the durable route record.
 type Conversation struct {
@@ -140,6 +142,24 @@ type Item struct {
 	Attempts          int
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
+}
+
+// Stop returns the frozen stop target for a stop control; ok is false for
+// any other kind.
+func (i Item) Stop() (targetInbox int64, targetRun string, cutoff int64, ok bool) {
+	if i.Kind != KindStop {
+		return 0, "", 0, false
+	}
+	return i.StopTargetInboxID, i.StopTargetRunID, i.StopCutoffSeq, true
+}
+
+// Receipt returns the admission receipt of an admitted or terminal prompt;
+// ok is false before admission or for controls.
+func (i Item) Receipt() (runID, userMsg, assistantMsg string, ok bool) {
+	if i.Kind != KindPrompt || i.RunID == "" {
+		return "", "", "", false
+	}
+	return i.RunID, i.ReceiptUserMsg, i.ReceiptAssistant, true
 }
 
 // Inbound is a normalized platform event ready for ingestion.

@@ -5,6 +5,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -59,17 +60,33 @@ const (
 	CeilingShutdownSeconds       = 120
 )
 
+// limitSpec describes one tunable limit: its config field, accessor,
+// default and ceiling. Every limit is listed exactly once here; defaults,
+// validation and the redacted summary iterate this table.
+type limitSpec struct {
+	Field   string
+	Get     func(*Limits) *int
+	Default int
+	Ceiling int
+}
+
+var limitSpecs = []limitSpec{
+	{"limits.max_running_conversations", func(l *Limits) *int { return &l.MaxRunningConversations }, 4, CeilingRunningConversations},
+	{"limits.max_queued_per_conversation", func(l *Limits) *int { return &l.MaxQueuedPerConversation }, 8, CeilingQueuedPerConversation},
+	{"limits.max_pending_inbox", func(l *Limits) *int { return &l.MaxPendingInbox }, 256, CeilingPendingInbox},
+	{"limits.max_prompt_bytes", func(l *Limits) *int { return &l.MaxPromptBytes }, 16 << 10, CeilingPromptBytes},
+	{"limits.model_turn_seconds", func(l *Limits) *int { return &l.ModelTurnSeconds }, 120, CeilingModelTurnSeconds},
+	{"limits.platform_call_seconds", func(l *Limits) *int { return &l.PlatformCallSeconds }, 10, CeilingPlatformCallSeconds},
+	{"limits.shutdown_seconds", func(l *Limits) *int { return &l.ShutdownSeconds }, 10, CeilingShutdownSeconds},
+}
+
 // DefaultLimits returns the v1 defaults.
 func DefaultLimits() Limits {
-	return Limits{
-		MaxRunningConversations:  4,
-		MaxQueuedPerConversation: 8,
-		MaxPendingInbox:          256,
-		MaxPromptBytes:           16 << 10,
-		ModelTurnSeconds:         120,
-		PlatformCallSeconds:      10,
-		ShutdownSeconds:          10,
+	var l Limits
+	for _, spec := range limitSpecs {
+		*spec.Get(&l) = spec.Default
 	}
+	return l
 }
 
 // Internal limits that are not exposed for tuning in v1.
@@ -134,7 +151,14 @@ var (
 	slackChannelRe = regexp.MustCompile(`^[CG][A-Z0-9]{2,}$`)
 	slackUserRe    = regexp.MustCompile(`^[UW][A-Z0-9]{2,}$`)
 	snowflakeRe    = regexp.MustCompile(`^[0-9]{15,22}$`)
+	slackTSRe      = regexp.MustCompile(`^[0-9]{10}\.[0-9]{6}$`)
 )
+
+// IsSnowflake reports whether id has the shape of a Discord snowflake.
+func IsSnowflake(id string) bool { return snowflakeRe.MatchString(id) }
+
+// IsSlackTimestamp reports whether id has the shape of a Slack message ts.
+func IsSlackTimestamp(id string) bool { return slackTSRe.MatchString(id) }
 
 // Load reads and validates a configuration file.
 func Load(path string) (Config, error) {
@@ -148,7 +172,7 @@ func Load(path string) (Config, error) {
 // Parse decodes and validates configuration JSON.
 func Parse(raw []byte) (Config, error) {
 	var cfg Config
-	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&cfg); err != nil {
 		return Config{}, fmt.Errorf("%w: decode config: %v", ErrInvalid, err)
@@ -164,28 +188,10 @@ func Parse(raw []byte) (Config, error) {
 }
 
 func (c *Config) applyDefaults() {
-	d := DefaultLimits()
-	l := &c.Limits
-	if l.MaxRunningConversations == 0 {
-		l.MaxRunningConversations = d.MaxRunningConversations
-	}
-	if l.MaxQueuedPerConversation == 0 {
-		l.MaxQueuedPerConversation = d.MaxQueuedPerConversation
-	}
-	if l.MaxPendingInbox == 0 {
-		l.MaxPendingInbox = d.MaxPendingInbox
-	}
-	if l.MaxPromptBytes == 0 {
-		l.MaxPromptBytes = d.MaxPromptBytes
-	}
-	if l.ModelTurnSeconds == 0 {
-		l.ModelTurnSeconds = d.ModelTurnSeconds
-	}
-	if l.PlatformCallSeconds == 0 {
-		l.PlatformCallSeconds = d.PlatformCallSeconds
-	}
-	if l.ShutdownSeconds == 0 {
-		l.ShutdownSeconds = d.ShutdownSeconds
+	for _, spec := range limitSpecs {
+		if v := spec.Get(&c.Limits); *v == 0 {
+			*v = spec.Default
+		}
 	}
 }
 
@@ -229,14 +235,9 @@ func (c Config) Validate() error {
 	} else if len(c.Discord.GuildIDs) != 0 || len(c.Discord.AllowedChannelIDs) != 0 || len(c.Discord.AllowedUserIDs) != 0 {
 		add("discord settings are present but discord.enabled is false")
 	}
-	l := c.Limits
-	checkLimit(&problems, "limits.max_running_conversations", l.MaxRunningConversations, CeilingRunningConversations)
-	checkLimit(&problems, "limits.max_queued_per_conversation", l.MaxQueuedPerConversation, CeilingQueuedPerConversation)
-	checkLimit(&problems, "limits.max_pending_inbox", l.MaxPendingInbox, CeilingPendingInbox)
-	checkLimit(&problems, "limits.max_prompt_bytes", l.MaxPromptBytes, CeilingPromptBytes)
-	checkLimit(&problems, "limits.model_turn_seconds", l.ModelTurnSeconds, CeilingModelTurnSeconds)
-	checkLimit(&problems, "limits.platform_call_seconds", l.PlatformCallSeconds, CeilingPlatformCallSeconds)
-	checkLimit(&problems, "limits.shutdown_seconds", l.ShutdownSeconds, CeilingShutdownSeconds)
+	for _, spec := range limitSpecs {
+		checkLimit(&problems, spec.Field, *spec.Get(&c.Limits), spec.Ceiling)
+	}
 	if len(problems) != 0 {
 		return fmt.Errorf("%w: %s", ErrInvalid, strings.Join(problems, "; "))
 	}

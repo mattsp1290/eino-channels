@@ -42,13 +42,25 @@ func (s *Store) GetItem(ctx context.Context, id int64) (Item, error) {
 	return scanItem(s.host.QueryRowContext(ctx, `SELECT `+itemColumns+` FROM inbox WHERE id = ?`, id))
 }
 
+// admitFn applies one kind's admission policy inside the ingest
+// transaction: it sets item.State (and any control fields) and may update
+// the disposition.
+type admitFn func(ctx context.Context, tx *sql.Tx, key string, limits Capacity, now time.Time, item *Item, d *Disposition) error
+
+var admitByKind = map[Kind]admitFn{
+	KindPrompt: admitPrompt,
+	KindStop:   admitStop,
+	KindNew:    admitNew,
+	KindHelp:   admitHelp,
+}
+
 // Ingest durably records one platform event. Dedup, capacity reservation,
 // route creation and control semantics commit in one transaction.
 //
 // Prompts and controls that exceed capacity or preconditions are stored as
 // rejected rows (so a retried event cannot be admitted later) and returned
 // with OutcomeRejected and Item.ResultCode set.
-func (s *Store) Ingest(ctx context.Context, in Inbound, cap Capacity) (Disposition, error) {
+func (s *Store) Ingest(ctx context.Context, in Inbound, limits Capacity) (Disposition, error) {
 	var d Disposition
 	now := in.ReceivedAt
 	if now.IsZero() {
@@ -72,90 +84,28 @@ func (s *Store) Ingest(ctx context.Context, in Inbound, cap Capacity) (Dispositi
 		d.Conversation = conv
 		key := in.Route.Key()
 		item := Item{DedupKey: dedup, Platform: in.Route.Platform, Installation: in.Route.Installation, MessageID: in.MessageID, RouteKey: key, Generation: conv.Generation, Kind: in.Kind, Actor: in.Actor, ActorLabel: in.ActorLabel, Content: in.Content, ContentHash: ContentHash(in.Content), FilesNotice: in.FilesNotice, AdmissionKey: in.AdmissionKey(), CreatedAt: now.UTC(), UpdatedAt: now.UTC()}
-		switch {
-		case in.RejectCode != "":
+		if in.RejectCode != "" {
 			item.State, item.ResultCode = StateRejected, in.RejectCode
 			item.Content = ""
-		case in.Kind == KindPrompt:
-			var perRoute, global int
-			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbox WHERE route_key = ? AND state IN (?, ?, ?)`, key, StateQueued, StateAdmitting, StateAdmitted).Scan(&perRoute); err != nil {
-				return storageErr(err)
+		} else {
+			admit, ok := admitByKind[in.Kind]
+			if !ok {
+				return fmt.Errorf("%w: unknown inbox kind", ErrConflict)
 			}
-			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbox WHERE state IN (?, ?)`, StateQueued, StatePending).Scan(&global); err != nil {
-				return storageErr(err)
-			}
-			if perRoute > cap.MaxQueuedPerRoute || global >= cap.MaxPendingGlobal {
-				item.State, item.ResultCode = StateRejected, CodeOverflow
-				item.Content = ""
-			} else {
-				item.State = StateQueued
-			}
-		case in.Kind == KindStop:
-			item.State = StatePending
-			// Freeze the target: the admitting/admitted item, or none.
-			target, err := scanItem(tx.QueryRowContext(ctx, `SELECT `+itemColumns+` FROM inbox WHERE route_key = ? AND state IN (?, ?) ORDER BY seq LIMIT 1`, key, StateAdmitting, StateAdmitted))
-			if err != nil && !errors.Is(err, ErrNotFound) {
+			if err := admit(ctx, tx, key, limits, now, &item, &d); err != nil {
 				return err
 			}
-			if err == nil {
-				item.StopTargetInboxID = target.ID
-				item.StopTargetRunID = target.RunID
-			}
-			var cutoff sql.NullInt64
-			if err := tx.QueryRowContext(ctx, `SELECT MAX(seq) FROM inbox WHERE route_key = ?`, key).Scan(&cutoff); err != nil {
-				return storageErr(err)
-			}
-			item.StopCutoffSeq = cutoff.Int64
-			res, err := tx.ExecContext(ctx, `UPDATE inbox SET state = ?, result_code = ?, content = NULL, updated_at = ? WHERE route_key = ? AND state = ? AND kind = ? AND seq <= ?`, StateCanceled, CodeCanceled, now.UnixNano(), key, StateQueued, KindPrompt, cutoff.Int64)
-			if err != nil {
-				return storageErr(err)
-			}
-			canceled, _ := res.RowsAffected()
-			if canceled == 0 && item.StopTargetInboxID == 0 {
-				// Nothing was running or queued: the control is complete on arrival.
-				item.State = StateComplete
-				d.StopNoop = true
-			}
-			item.Content = ""
-		case in.Kind == KindNew:
-			item.Content = ""
-			rotated, err := rotateGenerationTx(ctx, tx, key)
-			switch {
-			case errors.Is(err, ErrConflict):
-				item.State, item.ResultCode = StateRejected, CodeBusy
-			case err != nil:
-				return err
-			default:
-				item.State = StateComplete
-				d.Conversation = rotated
-				item.Generation = rotated.Generation
-			}
-		case in.Kind == KindHelp:
-			item.Content = ""
-			item.State = StateComplete
-		default:
-			return fmt.Errorf("%w: unknown inbox kind", ErrConflict)
 		}
-		seq, err := nextSeqTx(ctx, tx, key)
-		if err != nil {
+		if item.Seq, err = nextSeqTx(ctx, tx, key); err != nil {
 			return err
 		}
-		item.Seq = seq
-		var content any
-		if item.Content != "" || item.Kind == KindPrompt && item.State == StateQueued {
-			content = item.Content
+		if err := insertItemTx(ctx, tx, &item, now); err != nil {
+			return err
 		}
-		res, err := tx.ExecContext(ctx, `INSERT INTO inbox (dedup_key, platform, installation, message_id, route_key, generation, seq, kind, actor, actor_label, content, content_hash, files_notice, admission_key, state, result_code, stop_target_run_id, stop_target_inbox_id, stop_cutoff_seq, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			item.DedupKey, item.Platform, item.Installation, item.MessageID, item.RouteKey, item.Generation, item.Seq, item.Kind, item.Actor, item.ActorLabel, content, item.ContentHash, boolInt(item.FilesNotice), item.AdmissionKey, item.State, item.ResultCode, item.StopTargetRunID, item.StopTargetInboxID, item.StopCutoffSeq, now.UnixNano(), now.UnixNano())
-		if err != nil {
-			return storageErr(err)
-		}
-		item.ID, _ = res.LastInsertId()
 		d.Item = item
+		d.Outcome = OutcomeAccepted
 		if item.State == StateRejected {
 			d.Outcome = OutcomeRejected
-		} else {
-			d.Outcome = OutcomeAccepted
 		}
 		return nil
 	})
@@ -163,6 +113,92 @@ func (s *Store) Ingest(ctx context.Context, in Inbound, cap Capacity) (Dispositi
 		return Disposition{}, err
 	}
 	return d, nil
+}
+
+// admitPrompt reserves queue capacity or rejects with an overflow tombstone.
+func admitPrompt(ctx context.Context, tx *sql.Tx, key string, limits Capacity, _ time.Time, item *Item, _ *Disposition) error {
+	var perRoute, global int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbox WHERE route_key = ? AND state IN (?, ?, ?)`, key, StateQueued, StateAdmitting, StateAdmitted).Scan(&perRoute); err != nil {
+		return storageErr(err)
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbox WHERE state IN (?, ?)`, StateQueued, StatePending).Scan(&global); err != nil {
+		return storageErr(err)
+	}
+	// perRoute counts the active item too, so one active plus MaxQueuedPerRoute
+	// queued prompts are allowed; the global bound is strict.
+	if perRoute > limits.MaxQueuedPerRoute || global >= limits.MaxPendingGlobal {
+		item.State, item.ResultCode = StateRejected, CodeOverflow
+		item.Content = ""
+		return nil
+	}
+	item.State = StateQueued
+	return nil
+}
+
+// admitStop freezes the target and cutoff, cancels queued prompts up to the
+// cutoff, and completes on arrival when there was nothing to stop.
+func admitStop(ctx context.Context, tx *sql.Tx, key string, _ Capacity, now time.Time, item *Item, d *Disposition) error {
+	item.State, item.Content = StatePending, ""
+	target, err := scanItem(tx.QueryRowContext(ctx, `SELECT `+itemColumns+` FROM inbox WHERE route_key = ? AND state IN (?, ?) ORDER BY seq LIMIT 1`, key, StateAdmitting, StateAdmitted))
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	if err == nil {
+		item.StopTargetInboxID = target.ID
+		item.StopTargetRunID = target.RunID
+	}
+	var cutoff sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT MAX(seq) FROM inbox WHERE route_key = ?`, key).Scan(&cutoff); err != nil {
+		return storageErr(err)
+	}
+	item.StopCutoffSeq = cutoff.Int64
+	res, err := tx.ExecContext(ctx, `UPDATE inbox SET state = ?, result_code = ?, content = NULL, updated_at = ? WHERE route_key = ? AND state = ? AND kind = ? AND seq <= ?`, StateCanceled, CodeCanceled, now.UnixNano(), key, StateQueued, KindPrompt, cutoff.Int64)
+	if err != nil {
+		return storageErr(err)
+	}
+	canceled, _ := res.RowsAffected()
+	if canceled == 0 && item.StopTargetInboxID == 0 {
+		item.State = StateComplete
+		d.StopNoop = true
+	}
+	return nil
+}
+
+// admitNew rotates the generation when the route is idle, else rejects busy.
+func admitNew(ctx context.Context, tx *sql.Tx, key string, _ Capacity, _ time.Time, item *Item, d *Disposition) error {
+	item.Content = ""
+	rotated, err := rotateGenerationTx(ctx, tx, key)
+	switch {
+	case errors.Is(err, ErrConflict):
+		item.State, item.ResultCode = StateRejected, CodeBusy
+	case err != nil:
+		return err
+	default:
+		item.State = StateComplete
+		d.Conversation = rotated
+		item.Generation = rotated.Generation
+	}
+	return nil
+}
+
+// admitHelp records the control for dedup only.
+func admitHelp(_ context.Context, _ *sql.Tx, _ string, _ Capacity, _ time.Time, item *Item, _ *Disposition) error {
+	item.Content, item.State = "", StateComplete
+	return nil
+}
+
+func insertItemTx(ctx context.Context, tx *sql.Tx, item *Item, now time.Time) error {
+	var content any
+	if item.Content != "" || item.Kind == KindPrompt && item.State == StateQueued {
+		content = item.Content
+	}
+	res, err := tx.ExecContext(ctx, `INSERT INTO inbox (dedup_key, platform, installation, message_id, route_key, generation, seq, kind, actor, actor_label, content, content_hash, files_notice, admission_key, state, result_code, stop_target_run_id, stop_target_inbox_id, stop_cutoff_seq, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		item.DedupKey, item.Platform, item.Installation, item.MessageID, item.RouteKey, item.Generation, item.Seq, item.Kind, item.Actor, item.ActorLabel, content, item.ContentHash, boolInt(item.FilesNotice), item.AdmissionKey, item.State, item.ResultCode, item.StopTargetRunID, item.StopTargetInboxID, item.StopCutoffSeq, now.UnixNano(), now.UnixNano())
+	if err != nil {
+		return storageErr(err)
+	}
+	item.ID, _ = res.LastInsertId()
+	return nil
 }
 
 func boolInt(b bool) int {

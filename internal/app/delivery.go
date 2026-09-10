@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -17,10 +16,47 @@ import (
 	"github.com/mattsp1290/eino-channels/internal/state"
 )
 
-var (
-	slackTSRe   = regexp.MustCompile(`^[0-9]{10}\.[0-9]{6}$`)
-	snowflakeRe = regexp.MustCompile(`^[0-9]{15,22}$`)
-)
+// associatePolicy is the per-platform evidence rule for associate-message:
+// the remote ID shape, how the evidence is verified, and the audit tag.
+type associatePolicy struct {
+	IDHint string
+	IDOK   func(string) bool
+	// Verify checks the operator's evidence; it returns an exit code and a
+	// message when the association must be refused.
+	Verify   func(ctx context.Context, d state.Delivery, messageID string, confirm bool, getenv func(string) string, verifier MessageVerifier) (int, string)
+	AuditTag string
+}
+
+var associatePolicies = map[state.Platform]associatePolicy{
+	state.PlatformSlack: {
+		IDHint: "--message-id must be a Slack message timestamp", IDOK: config.IsSlackTimestamp,
+		Verify: func(_ context.Context, _ state.Delivery, _ string, confirm bool, _ func(string) string, _ MessageVerifier) (int, string) {
+			if !confirm {
+				return 2, "Slack association requires --confirm-inspected: inspect the destination and confirm the timestamp identifies the intended bot message"
+			}
+			return 0, ""
+		},
+		AuditTag: "operator-attested slack association",
+	},
+	state.PlatformDiscord: {
+		IDHint: "--message-id must be a Discord message ID", IDOK: config.IsSnowflake,
+		Verify: func(ctx context.Context, d state.Delivery, messageID string, _ bool, getenv func(string) string, verifier MessageVerifier) (int, string) {
+			// Only the Discord token is needed for this verification.
+			token := strings.TrimSpace(getenv(config.EnvDiscordBotToken))
+			if token == "" {
+				return 2, config.EnvDiscordBotToken + " is required to verify a Discord message"
+			}
+			if verifier == nil {
+				verifier = discordVerifier{}
+			}
+			if err := verifier.VerifyDiscord(ctx, token, d.Destination.Channel, messageID); err != nil {
+				return 1, "verification failed: " + err.Error()
+			}
+			return 0, ""
+		},
+		AuditTag: "api-verified discord association",
+	},
+}
 
 // deliveryCommand implements `delivery list` and `delivery resolve`. Both
 // require the daemon stopped (exclusive lock) and never expose prompt or
@@ -160,41 +196,20 @@ func deliveryResolve(args []string, stdout, stderr io.Writer, getenv func(string
 			fmt.Fprintln(stderr, "--message-id is required for associate-message")
 			return 2
 		}
-		var audit string
-		switch d.Destination.Platform {
-		case state.PlatformSlack:
-			if !slackTSRe.MatchString(*messageID) {
-				fmt.Fprintln(stderr, "--message-id must be a Slack message timestamp")
-				return 2
-			}
-			if !*confirm {
-				fmt.Fprintln(stderr, "Slack association requires --confirm-inspected: inspect the destination and confirm the timestamp identifies the intended bot message")
-				return 2
-			}
-			audit = "operator-attested slack association " + time.Now().UTC().Format(time.RFC3339)
-		case state.PlatformDiscord:
-			if !snowflakeRe.MatchString(*messageID) {
-				fmt.Fprintln(stderr, "--message-id must be a Discord message ID")
-				return 2
-			}
-			// Only the Discord token is needed for this verification.
-			token := strings.TrimSpace(getenv(config.EnvDiscordBotToken))
-			if token == "" {
-				fmt.Fprintf(stderr, "%s is required to verify a Discord message\n", config.EnvDiscordBotToken)
-				return 2
-			}
-			if verifier == nil {
-				verifier = discordVerifier{}
-			}
-			if err := verifier.VerifyDiscord(ctx, token, d.Destination.Channel, *messageID); err != nil {
-				fmt.Fprintln(stderr, "verification failed:", err.Error())
-				return 1
-			}
-			audit = "api-verified discord association " + time.Now().UTC().Format(time.RFC3339)
-		default:
+		policy, ok := associatePolicies[d.Destination.Platform]
+		if !ok {
 			fmt.Fprintln(stderr, "unknown platform")
 			return 1
 		}
+		if !policy.IDOK(*messageID) {
+			fmt.Fprintln(stderr, policy.IDHint)
+			return 2
+		}
+		if code, msg := policy.Verify(ctx, d, *messageID, *confirm, getenv, verifier); code != 0 {
+			fmt.Fprintln(stderr, msg)
+			return code
+		}
+		audit := policy.AuditTag + " " + time.Now().UTC().Format(time.RFC3339)
 		if err := st.AssociateMessage(ctx, id, *messageID, audit); err != nil {
 			fmt.Fprintln(stderr, "association failed:", err.Error())
 			return 1

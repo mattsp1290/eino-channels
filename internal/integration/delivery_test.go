@@ -53,7 +53,7 @@ func TestDeliveryRateLimitThenPermanentFailure(t *testing.T) {
 	}
 	// Removed allowlist access prevents sending stored output.
 	env.slack.FailCreate = nil
-	env.slack.Deny = func(d state.Destination) bool { return d.DMActor == "U3" }
+	env.slack.Deny = func(_ state.Destination, subject string) bool { return subject == "U3" }
 	r3 := env.ingest(testkit.DM("D3", "U3", "6.000003", "denied"))
 	testkit.Eventually(t, 30*time.Second, func() bool {
 		it, err := env.store.GetItem(context.Background(), r3.Item.ID)

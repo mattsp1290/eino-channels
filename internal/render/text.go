@@ -60,86 +60,113 @@ func Chunk(text string, budget int, measure Measure) []string {
 	if measure(text) <= budget {
 		return []string{text}
 	}
-	const fenceReserve = 12 // closing "\n```" plus reopening fence line
-	// A fence line longer than this share of the budget is not tracked as a
-	// fence: re-opening it in every chunk would let model output multiply
-	// the number of messages.
-	maxFence := budget / 4
-	var chunks []string
-	var cur strings.Builder
-	curLen := 0
-	openFence := "" // the fence line currently open, e.g. "```go"
-	flush := func() {
-		if cur.Len() == 0 {
-			return
-		}
-		s := cur.String()
-		if openFence != "" {
-			if !strings.HasSuffix(s, "\n") {
-				s += "\n"
-			}
-			s += "```\n"
-		}
-		chunks = append(chunks, s)
-		cur.Reset()
-		curLen = 0
-		if openFence != "" {
-			cur.WriteString(openFence + "\n")
-			curLen = measure(openFence) + 1
+	c := &chunker{budget: budget, measure: measure, maxFence: budget / 4}
+	for line := range strings.SplitAfterSeq(text, "\n") {
+		if line != "" {
+			c.add(line)
 		}
 	}
-	lines := strings.SplitAfter(text, "\n")
-	for _, line := range lines {
-		if line == "" {
-			continue
-		}
-		limit := budget
-		if openFence != "" || isFence(line) {
-			// Every fence line reserves room for the balancing markers, an
-			// overlong opener included: it still opens a block.
-			limit = max(budget-fenceReserve-measure(openFence), budget/2)
-		}
-		ll := measure(line)
-		if curLen+ll > limit && curLen > 0 {
-			flush()
-		}
-		if ll > limit {
-			for _, piece := range splitUnits(line, limit-curLen, limit, measure) {
-				if curLen+measure(piece) > limit && curLen > 0 {
-					flush()
-				}
-				cur.WriteString(piece)
-				curLen += measure(piece)
-			}
-		} else {
-			cur.WriteString(line)
-			curLen += ll
-		}
-		if isFence(line) {
-			switch {
-			case openFence != "":
-				openFence = ""
-			case measure(line) <= maxFence:
-				openFence = strings.TrimRight(line, "\n")
-			default:
-				// An overlong opener still opens a block; chunks reopen it
-				// with a plain fence so the line is never repeated.
-				openFence = "```"
-			}
-		}
+	return c.done()
+}
+
+const fenceReserve = 12 // closing "\n```" plus reopening fence line
+
+// chunker accumulates lines into budgeted chunks while tracking the open
+// code fence so every chunk renders balanced.
+type chunker struct {
+	budget  int
+	measure Measure
+	// maxFence bounds the fence line that may be reopened in every chunk;
+	// a longer opener is reopened as a plain fence so model output cannot
+	// multiply the number of messages.
+	maxFence  int
+	out       []string
+	cur       strings.Builder
+	curLen    int
+	openFence string // the fence line currently open, e.g. "```go"
+}
+
+// limit is the budget for the current line, reserving room for fence
+// balancing markers whenever a fence is open or the line is one.
+func (c *chunker) limit(line string) int {
+	if c.openFence != "" || isFence(line) {
+		return max(c.budget-fenceReserve-c.measure(c.openFence), c.budget/2)
 	}
-	if cur.Len() != 0 {
-		s := cur.String()
-		if openFence != "" {
-			// Unterminated fence in the source: close it so the last chunk renders.
+	return c.budget
+}
+
+func (c *chunker) add(line string) {
+	limit := c.limit(line)
+	ll := c.measure(line)
+	if ll > limit {
+		for _, piece := range splitUnits(line, limit-c.curLen, limit, c.measure) {
+			c.write(piece, limit)
+		}
+	} else {
+		c.write(line, limit)
+	}
+	if isFence(line) {
+		c.trackFence(line)
+	}
+}
+
+// write appends a piece, flushing first when it would overflow.
+func (c *chunker) write(piece string, limit int) {
+	n := c.measure(piece)
+	if c.curLen+n > limit && c.curLen > 0 {
+		c.flush()
+	}
+	c.cur.WriteString(piece)
+	c.curLen += n
+}
+
+func (c *chunker) trackFence(line string) {
+	switch {
+	case c.openFence != "":
+		c.openFence = ""
+	case c.measure(line) <= c.maxFence:
+		c.openFence = strings.TrimRight(line, "\n")
+	default:
+		c.openFence = "```"
+	}
+}
+
+// flush closes the current chunk, balancing an open fence and reopening it
+// in the next chunk.
+func (c *chunker) flush() {
+	if c.cur.Len() == 0 {
+		return
+	}
+	s := c.cur.String()
+	if c.openFence != "" {
+		if !strings.HasSuffix(s, "\n") {
+			s += "\n"
+		}
+		s += "```\n"
+	}
+	c.out = append(c.out, s)
+	c.cur.Reset()
+	c.curLen = 0
+	if c.openFence != "" {
+		c.cur.WriteString(c.openFence + "\n")
+		c.curLen = c.measure(c.openFence) + 1
+	}
+}
+
+// done returns the chunks, closing an unterminated source fence so the last
+// chunk renders.
+func (c *chunker) done() []string {
+	if c.cur.Len() != 0 {
+		s := c.cur.String()
+		if c.openFence != "" {
 			if !strings.HasSuffix(s, "\n") {
 				s += "\n"
 			}
 			s += "```"
 		}
-		chunks = append(chunks, s)
+		c.out = append(c.out, s)
 	}
-	return chunks
+	return c.out
 }
 
 func isFence(line string) bool {

@@ -137,8 +137,8 @@ type Deliverer struct {
 	FailEdit func(remoteID, text string) error
 	// Reconciled, when set, answers reconcile lookups.
 	Reconciled map[string]string // nonce -> remote id
-	// Deny, when non-nil, rejects destinations.
-	Deny func(state.Destination) bool
+	// Deny, when non-nil, rejects destinations (subject is the DM actor).
+	Deny func(dest state.Destination, subject string) bool
 	// AllowedErr, when non-nil, makes Allowed report that the check cannot
 	// be made now (an adapter whose identity is not established yet).
 	AllowedErr error
@@ -228,14 +228,14 @@ func (d *Deliverer) Reconcile(_ context.Context, dest state.Destination, nonce s
 }
 
 // Allowed implements conversation.Deliverer.
-func (d *Deliverer) Allowed(_ context.Context, dest state.Destination) (bool, error) {
+func (d *Deliverer) Allowed(_ context.Context, dest state.Destination, subject string) (bool, error) {
 	d.mu.Lock()
 	deny, err := d.Deny, d.AllowedErr
 	d.mu.Unlock()
 	if err != nil {
 		return false, err
 	}
-	return deny == nil || !deny(dest), nil
+	return deny == nil || !deny(dest, subject), nil
 }
 
 // SetAllowedErr sets AllowedErr under the lock.

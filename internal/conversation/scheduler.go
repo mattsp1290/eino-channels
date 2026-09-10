@@ -3,6 +3,7 @@ package conversation
 import (
 	"time"
 
+	"github.com/mattsp1290/eino-channels/internal/redact"
 	"github.com/mattsp1290/eino-channels/internal/state"
 )
 
@@ -19,6 +20,7 @@ func (s *Service) scheduler() {
 	defer s.loops.Done()
 	ticker := time.NewTicker(scheduleTick)
 	defer ticker.Stop()
+	cursor := "" // rotation position; owned by this goroutine
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -29,24 +31,22 @@ func (s *Service) scheduler() {
 		// An ingest scans from the start so the changed route is not behind
 		// the cursor; runner completions keep the rotation.
 		s.mu.Lock()
-		if s.rescan {
-			s.rescan = false
-			s.cursor = ""
-		}
-		s.mu.Unlock()
-		s.mu.Lock()
-		closing := s.closing
+		rescan, closing := s.rescan, s.closing
+		s.rescan = false
 		s.mu.Unlock()
 		if closing {
 			return
 		}
-		keys, err := s.st.RoutesWithWork(s.ctx, s.cursor, routeBatch)
-		if err == nil && len(keys) == 0 && s.cursor != "" {
-			s.cursor = ""
+		if rescan {
+			cursor = ""
+		}
+		keys, err := s.st.RoutesWithWork(s.ctx, cursor, routeBatch)
+		if err == nil && len(keys) == 0 && cursor != "" {
+			cursor = ""
 			keys, err = s.st.RoutesWithWork(s.ctx, "", routeBatch)
 		}
 		if err != nil {
-			s.log.Warn("scheduler scan failed", "error", safeErr(err))
+			s.log.Warn("scheduler scan failed", "error", redact.Err(err))
 			continue
 		}
 		now := time.Now()
@@ -58,7 +58,7 @@ func (s *Service) scheduler() {
 				full = true
 				break // the cursor stays before this key so it is attempted next
 			}
-			s.cursor = key
+			cursor = key
 			_, running := s.active[key]
 			until, parked := s.parked[key]
 			if running || parked && now.Before(until) {
@@ -72,7 +72,7 @@ func (s *Service) scheduler() {
 			go s.runRoute(key)
 		}
 		if !full && len(keys) < routeBatch {
-			s.cursor = "" // the batch was exhausted; next scan starts over
+			cursor = "" // the batch was exhausted; next scan starts over
 		}
 	}
 }
@@ -127,7 +127,7 @@ func (s *Service) runRoute(key string) {
 	}()
 	conv, err := s.st.GetConversationByKey(s.ctx, key)
 	if err != nil {
-		s.log.Warn("route unavailable", "error", safeErr(err))
+		s.log.Warn("route unavailable", "error", redact.Err(err))
 		s.park(key, parkUnavailable, s.ingestSeq(key))
 		return
 	}
@@ -166,7 +166,7 @@ func (s *Service) runRoute(key string) {
 			}
 			continue
 		case !isNotFound(err):
-			s.log.Warn("next work failed", "error", safeErr(err))
+			s.log.Warn("next work failed", "error", redact.Err(err))
 			if s.park(key, parkUnavailable, seen) {
 				return
 			}

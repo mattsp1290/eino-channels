@@ -22,6 +22,7 @@ import (
 
 	"github.com/mattsp1290/eino-channels/internal/config"
 	"github.com/mattsp1290/eino-channels/internal/conversation"
+	"github.com/mattsp1290/eino-channels/internal/render"
 	"github.com/mattsp1290/eino-channels/internal/state"
 )
 
@@ -92,7 +93,7 @@ func (a *Adapter) Attach(svc *conversation.Service) { a.svc = svc }
 func (a *Adapter) Identity(ctx context.Context) error {
 	resp, err := a.api.AuthTestContext(ctx)
 	if err != nil {
-		return fmt.Errorf("slack: auth.test failed: %w", classify(err, false))
+		return fmt.Errorf("slack: auth.test failed: %w", classifyCall(err))
 	}
 	if resp.TeamID != a.cfg.TeamID {
 		return errors.New("slack: bot token belongs to a different team than configured")
@@ -100,11 +101,11 @@ func (a *Adapter) Identity(ctx context.Context) error {
 	if resp.UserID == "" {
 		return errors.New("slack: auth.test returned no bot user")
 	}
-	a.setIdentity(resp.TeamID, resp.UserID)
+	a.setIdentity(resp.UserID)
 	return nil
 }
 
-func (a *Adapter) setIdentity(_, botUserID string) {
+func (a *Adapter) setIdentity(botUserID string) {
 	a.idMu.Lock()
 	a.botUserID = botUserID
 	a.mention = regexp.MustCompile(`<@` + regexp.QuoteMeta(botUserID) + `(\|[^>]*)?>`)
@@ -190,7 +191,12 @@ func (a *Adapter) handleEventsAPI(ctx context.Context, payload slackevents.Event
 	if payload.Type != slackevents.CallbackEvent || payload.TeamID != a.cfg.TeamID {
 		return true
 	}
-	if cb, ok := payload.Data.(*slackevents.EventsAPICallbackEvent); payload.IsExtSharedChannel || ok && cb.IsExtSharedChannel {
+	// Slack Connect / external shared channels are out of scope; the flag
+	// can appear on the outer event or on the callback envelope.
+	if payload.IsExtSharedChannel {
+		return true
+	}
+	if cb, ok := payload.Data.(*slackevents.EventsAPICallbackEvent); ok && cb.IsExtSharedChannel {
 		return true
 	}
 	in, ok := a.normalize(payload.InnerEvent, botUserID, mention)
@@ -205,66 +211,87 @@ func (a *Adapter) handleEventsAPI(ctx context.Context, payload slackevents.Event
 		return false
 	}
 	if resp.Notice != "" {
-		a.svc.Notify(in.Route.Destination(), resp.Notice)
+		a.svc.Notify(in.Route, resp.Notice)
 	}
 	return true
 }
 
+// message is the platform-neutral view of one Slack event, built by one
+// constructor per event type so it is explicit which fields each type
+// populates.
+type message struct {
+	User, Text, TS, ThreadTS, Channel, BotID string
+	UserTeam, SourceTeam                     string
+	HasFiles, Edited, DM                     bool
+}
+
+func fromAppMention(e *slackevents.AppMentionEvent) message {
+	return message{User: e.User, Text: e.Text, TS: e.TimeStamp, ThreadTS: e.ThreadTimeStamp, Channel: e.Channel, BotID: e.BotID, UserTeam: e.UserTeam, SourceTeam: e.SourceTeam, HasFiles: len(e.Files) != 0, Edited: e.Edited != nil, DM: strings.HasPrefix(e.Channel, "D")}
+}
+
+// fromDirectMessage accepts only plain new messages in a DM channel.
+func fromDirectMessage(e *slackevents.MessageEvent) (message, bool) {
+	if e.ChannelType != "im" || e.SubType != "" || e.IsEdited() {
+		return message{}, false
+	}
+	m := message{User: e.User, Text: e.Text, TS: e.TimeStamp, ThreadTS: e.ThreadTimeStamp, Channel: e.Channel, BotID: e.BotID, UserTeam: e.UserTeam, SourceTeam: e.SourceTeam, DM: true}
+	if e.Message != nil {
+		if e.Message.Hidden || e.Message.BotID != "" {
+			return message{}, false
+		}
+		m.HasFiles = len(e.Message.Files) != 0
+	}
+	return m, true
+}
+
 // normalize converts a callback inner event into a validated Inbound.
 func (a *Adapter) normalize(inner slackevents.EventsAPIInnerEvent, botUserID string, mention *regexp.Regexp) (state.Inbound, bool) {
-	var user, text, ts, threadTS, channel, botID, userTeam, sourceTeam string
-	var files, edited, dm bool
+	var m message
 	switch e := inner.Data.(type) {
 	case *slackevents.AppMentionEvent:
-		user, text, ts, threadTS, channel, botID = e.User, e.Text, e.TimeStamp, e.ThreadTimeStamp, e.Channel, e.BotID
-		userTeam, sourceTeam = e.UserTeam, e.SourceTeam
-		files, edited = len(e.Files) != 0, e.Edited != nil
-		dm = strings.HasPrefix(channel, "D")
+		m = fromAppMention(e)
 	case *slackevents.MessageEvent:
-		if e.ChannelType != "im" || e.SubType != "" || e.IsEdited() {
+		var ok bool
+		if m, ok = fromDirectMessage(e); !ok {
 			return state.Inbound{}, false
 		}
-		user, text, ts, threadTS, channel, botID = e.User, e.Text, e.TimeStamp, e.ThreadTimeStamp, e.Channel, e.BotID
-		userTeam, sourceTeam = e.UserTeam, e.SourceTeam
-		if e.Message != nil {
-			files = len(e.Message.Files) != 0
-			if e.Message.Hidden || e.Message.BotID != "" {
-				return state.Inbound{}, false
-			}
-		}
-		dm = true
 	default:
 		return state.Inbound{}, false
 	}
-	if botID != "" || user == "" || user == botUserID || edited || ts == "" || channel == "" {
+	return a.validate(m, botUserID, mention)
+}
+
+// validate applies identity, allowlist, mention and routing rules.
+func (a *Adapter) validate(m message, botUserID string, mention *regexp.Regexp) (state.Inbound, bool) {
+	if m.BotID != "" || m.User == "" || m.User == botUserID || m.Edited || m.TS == "" || m.Channel == "" {
 		return state.Inbound{}, false
 	}
-	if userTeam != "" && userTeam != a.cfg.TeamID || sourceTeam != "" && sourceTeam != a.cfg.TeamID {
+	if m.UserTeam != "" && m.UserTeam != a.cfg.TeamID || m.SourceTeam != "" && m.SourceTeam != a.cfg.TeamID {
 		return state.Inbound{}, false // Slack Connect / external identity is out of scope
 	}
-	if !a.users.Contains(user) {
+	if !a.users.Contains(m.User) {
 		return state.Inbound{}, false
 	}
-	route := state.Route{Platform: state.PlatformSlack, Installation: a.cfg.TeamID, Channel: channel}
-	if dm {
-		route.DMActor = user
+	route := state.Route{Platform: state.PlatformSlack, Installation: a.cfg.TeamID, Channel: m.Channel}
+	if m.DM {
+		route.DMActor = m.User
 	} else {
-		if !a.channels.Contains(channel) {
+		if !a.channels.Contains(m.Channel) {
 			return state.Inbound{}, false
 		}
-		if !mention.MatchString(text) {
+		if !mention.MatchString(m.Text) {
 			return state.Inbound{}, false // shared-thread follow-ups require a fresh mention
 		}
-		route.ThreadRoot = threadTS
+		route.ThreadRoot = m.ThreadTS
 		if route.ThreadRoot == "" {
-			route.ThreadRoot = ts
+			route.ThreadRoot = m.TS
 		}
 	}
-	text = strings.TrimSpace(mention.ReplaceAllString(text, ""))
+	text := strings.TrimSpace(mention.ReplaceAllString(m.Text, ""))
 	if text == "" {
 		return state.Inbound{}, false // blank or attachment-only
 	}
-	return state.Inbound{Route: route, MessageID: ts, Actor: user, ActorLabel: user, Content: text, FilesNotice: files, ReceivedAt: time.Now()}, true
+	return state.Inbound{Route: route, MessageID: m.TS, Actor: m.User, ActorLabel: m.User, Content: text, FilesNotice: m.HasFiles, ReceivedAt: time.Now()}, true
 }
 
 // --- delivery -----------------------------------------------------------------
@@ -287,7 +314,7 @@ func (d *Deliverer) options(dest state.Destination, text string) []slack.MsgOpti
 func (d *Deliverer) Create(ctx context.Context, dest state.Destination, text, _ string) (string, error) {
 	_, ts, err := d.a.api.PostMessageContext(ctx, dest.Channel, d.options(dest, text)...)
 	if err != nil {
-		return "", classify(err, true)
+		return "", classifyCreate(err)
 	}
 	return ts, nil
 }
@@ -296,7 +323,7 @@ func (d *Deliverer) Create(ctx context.Context, dest state.Destination, text, _ 
 func (d *Deliverer) Edit(ctx context.Context, dest state.Destination, remoteID, text string) error {
 	_, _, _, err := d.a.api.UpdateMessageContext(ctx, dest.Channel, remoteID, slack.MsgOptionText(text, false), slack.MsgOptionParse(false), slack.MsgOptionLinkNames(false))
 	if err != nil {
-		return classify(err, false)
+		return classifyCall(err)
 	}
 	return nil
 }
@@ -309,37 +336,40 @@ func (d *Deliverer) Reconcile(context.Context, state.Destination, string) (strin
 
 // Allowed rechecks the destination against the allowlists. Socket Mode
 // health is not authorization: Web API delivery is independent of it.
-func (d *Deliverer) Allowed(_ context.Context, dest state.Destination) (bool, error) {
+func (d *Deliverer) Allowed(_ context.Context, dest state.Destination, subject string) (bool, error) {
 	if dest.Platform != state.PlatformSlack || dest.Installation != d.a.cfg.TeamID {
 		return false, nil
 	}
-	if dest.DMActor != "" {
-		return d.a.users.Contains(dest.DMActor), nil
+	if subject != "" {
+		return d.a.users.Contains(subject), nil
 	}
 	return d.a.channels.Contains(dest.Channel), nil
 }
 
 // Notify posts a transient notice.
 func (d *Deliverer) Notify(ctx context.Context, dest state.Destination, text string) error {
-	_, err := d.Create(ctx, dest, d.escape(text), "")
+	_, err := d.Create(ctx, dest, render.EscapeSlack(text), "")
 	return err
 }
 
-func (d *Deliverer) escape(text string) string { return conversationEscape(text) }
-
 // Chunks escapes and splits committed text.
 func (d *Deliverer) Chunks(text string) []string {
-	return chunkSlack(d.escape(text))
+	return render.Chunk(render.EscapeSlack(text), render.SlackChunkChars, render.SlackMeasure)
 }
 
 // Preview renders transient text.
 func (d *Deliverer) Preview(text string) string {
-	return previewSlack(d.escape(text))
+	return render.Preview(render.EscapeSlack(text), render.SlackChunkChars, render.SlackMeasure)
 }
 
-// classify maps SDK errors to delivery errors. Network failures after a
-// create are ambiguous; everything else is definite unless permanent.
-func classify(err error, create bool) error {
+// classifyCreate classifies a failed create: an unknown outcome is ambiguous
+// because the message may have landed and Slack has no nonce to check.
+func classifyCreate(err error) error { return classify(err, conversation.CreateOutcome) }
+
+// classifyCall classifies any other failed Web API call.
+func classifyCall(err error) error { return classify(err, conversation.CallOutcome) }
+
+func classify(err error, policy conversation.OutcomePolicy) error {
 	var rl *slack.RateLimitedError
 	if errors.As(err, &rl) {
 		return &conversation.DeliveryError{Kind: conversation.KindRateLimited, RetryAfter: rl.RetryAfter, Err: err}
@@ -348,9 +378,8 @@ func classify(err error, create bool) error {
 	if errors.As(err, &api) {
 		switch api.Err {
 		case "fatal_error", "internal_error":
-			// Slack documents these as possibly partially applied; a create
-			// may have landed and Slack has no nonce to check.
-			if create {
+			// Slack documents these as possibly partially applied.
+			if policy == conversation.CreateOutcome {
 				return &conversation.DeliveryError{Kind: conversation.KindAmbiguous, Err: errors.New("slack: " + api.Err)}
 			}
 			return &conversation.DeliveryError{Kind: conversation.KindDefinite, Err: errors.New("slack: " + api.Err)}
@@ -359,10 +388,5 @@ func classify(err error, create bool) error {
 		}
 		return &conversation.DeliveryError{Kind: conversation.KindDefinite, Err: errors.New("slack: " + api.Err)}
 	}
-	if create {
-		// Cancellation or a transport failure after a create was sent does
-		// not prove Slack never processed it; Slack has no nonce to check.
-		return &conversation.DeliveryError{Kind: conversation.KindAmbiguous, Err: errors.New("slack: transport failure")}
-	}
-	return &conversation.DeliveryError{Kind: conversation.KindDefinite, Err: errors.New("slack: transport failure")}
+	return conversation.TransportFailure("slack", policy)
 }

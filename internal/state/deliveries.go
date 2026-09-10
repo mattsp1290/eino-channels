@@ -39,16 +39,13 @@ const (
 // must not re-run their route on every scan.
 const schedulableDelivery = `status = 'pending'`
 
-// Delivery reads LEFT JOIN conversations for dm_actor so an orphaned row can
-// never silently vanish from the lane.
-const deliveryColumns = `d.id, d.route_key, d.generation, d.inbox_id, d.run_id, d.delivery_seq, d.chunk_index, d.platform, d.installation, d.channel, d.thread_root, COALESCE(c.dm_actor, ''), d.remote_id, d.nonce, d.desired_revision, d.acked_revision, d.desired_text, d.content_hash, d.status, d.op_state, d.attempts, d.first_attempt_at, d.retry_at, d.audit, d.created_at, d.updated_at`
+const deliveryColumns = `d.id, d.route_key, d.generation, d.inbox_id, d.run_id, d.delivery_seq, d.chunk_index, d.platform, d.installation, d.channel, d.thread_root, d.remote_id, d.nonce, d.desired_revision, d.acked_revision, d.desired_text, d.content_hash, d.status, d.op_state, d.attempts, d.first_attempt_at, d.retry_at, d.audit, d.created_at, d.updated_at`
 
 func scanDelivery(row interface{ Scan(...any) error }) (Delivery, error) {
 	var d Delivery
 	var text sql.NullString
-	var dmActor string
 	var first, retry, created, updated int64
-	err := row.Scan(&d.ID, &d.RouteKey, &d.Generation, &d.InboxID, &d.RunID, &d.DeliverySeq, &d.ChunkIndex, &d.Destination.Platform, &d.Destination.Installation, &d.Destination.Channel, &d.Destination.ThreadRoot, &dmActor, &d.RemoteID, &d.Nonce, &d.DesiredRevision, &d.AckedRevision, &text, &d.ContentHash, &d.Status, &d.Op, &d.Attempts, &first, &retry, &d.Audit, &created, &updated)
+	err := row.Scan(&d.ID, &d.RouteKey, &d.Generation, &d.InboxID, &d.RunID, &d.DeliverySeq, &d.ChunkIndex, &d.Destination.Platform, &d.Destination.Installation, &d.Destination.Channel, &d.Destination.ThreadRoot, &d.RemoteID, &d.Nonce, &d.DesiredRevision, &d.AckedRevision, &text, &d.ContentHash, &d.Status, &d.Op, &d.Attempts, &first, &retry, &d.Audit, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Delivery{}, ErrNotFound
 	}
@@ -56,7 +53,6 @@ func scanDelivery(row interface{ Scan(...any) error }) (Delivery, error) {
 		return Delivery{}, storageErr(err)
 	}
 	d.DesiredText, d.HasDesiredText = text.String, text.Valid
-	d.Destination.DMActor = dmActor
 	if first != 0 {
 		d.FirstAttemptAt = time.Unix(0, first).UTC()
 	}
@@ -114,7 +110,7 @@ func (s *Store) PlanPreview(ctx context.Context, item Item, placeholder string) 
 			return err
 		}
 		var err error
-		out, err = scanDelivery(tx.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d LEFT JOIN conversations c ON c.route_key = d.route_key WHERE d.run_id = ? AND d.chunk_index = 0`, item.RunID))
+		out, err = scanDelivery(tx.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d WHERE d.run_id = ? AND d.chunk_index = 0`, item.RunID))
 		return err
 	})
 	return out, err
@@ -123,7 +119,7 @@ func (s *Store) PlanPreview(ctx context.Context, item Item, placeholder string) 
 // NextDelivery returns the lowest-ordered unresolved delivery of the route
 // and whether the lane is blocked by a failed or ambiguous predecessor.
 func (s *Store) NextDelivery(ctx context.Context, routeKey string) (Delivery, bool, error) {
-	d, err := scanDelivery(s.host.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d LEFT JOIN conversations c ON c.route_key = d.route_key WHERE d.route_key = ? AND `+unresolvedDeliveryD+` ORDER BY d.delivery_seq, d.chunk_index LIMIT 1`, routeKey))
+	d, err := scanDelivery(s.host.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d WHERE d.route_key = ? AND `+unresolvedDeliveryD+` ORDER BY d.delivery_seq, d.chunk_index LIMIT 1`, routeKey))
 	if err != nil {
 		return Delivery{}, false, err
 	}
@@ -133,12 +129,12 @@ func (s *Store) NextDelivery(ctx context.Context, routeKey string) (Delivery, bo
 
 // GetDelivery loads one row.
 func (s *Store) GetDelivery(ctx context.Context, id int64) (Delivery, error) {
-	return scanDelivery(s.host.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d LEFT JOIN conversations c ON c.route_key = d.route_key WHERE d.id = ?`, id))
+	return scanDelivery(s.host.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d WHERE d.id = ?`, id))
 }
 
 // DeliveryForRun loads the chunk row of a run.
 func (s *Store) DeliveryForRun(ctx context.Context, runID string, chunk int) (Delivery, error) {
-	return scanDelivery(s.host.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d LEFT JOIN conversations c ON c.route_key = d.route_key WHERE d.run_id = ? AND d.chunk_index = ?`, runID, chunk))
+	return scanDelivery(s.host.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d WHERE d.run_id = ? AND d.chunk_index = ?`, runID, chunk))
 }
 
 // MarkCreateIntent persists the intent (and nonce) before a create call.
@@ -155,7 +151,7 @@ func (s *Store) MarkCreateIntent(ctx context.Context, id int64) (Delivery, error
 		if n, _ := res.RowsAffected(); n != 1 {
 			return fmt.Errorf("%w: delivery %d already has a remote message", ErrConflict, id)
 		}
-		out, err = scanDelivery(tx.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d LEFT JOIN conversations c ON c.route_key = d.route_key WHERE d.id = ?`, id))
+		out, err = scanDelivery(tx.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d WHERE d.id = ?`, id))
 		return err
 	})
 	return out, err
@@ -253,7 +249,7 @@ func (s *Store) SetDesired(ctx context.Context, id int64, text string, revision 
 
 // ListDeliveries returns bounded rows for operator listing.
 func (s *Store) ListDeliveries(ctx context.Context, limit int) ([]Delivery, error) {
-	rows, err := s.host.QueryContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d LEFT JOIN conversations c ON c.route_key = d.route_key WHERE `+unresolvedDeliveryD+` ORDER BY d.id LIMIT ?`, limit)
+	rows, err := s.host.QueryContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d WHERE `+unresolvedDeliveryD+` ORDER BY d.id LIMIT ?`, limit)
 	if err != nil {
 		return nil, storageErr(err)
 	}
@@ -274,7 +270,7 @@ func (s *Store) ListDeliveries(ctx context.Context, limit int) ([]Delivery, erro
 // latest desired revision remains pending as an edit.
 func (s *Store) AssociateMessage(ctx context.Context, id int64, remoteID, audit string) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
-		d, err := scanDelivery(tx.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d LEFT JOIN conversations c ON c.route_key = d.route_key WHERE d.id = ?`, id))
+		d, err := scanDelivery(tx.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d WHERE d.id = ?`, id))
 		if err != nil {
 			return err
 		}
@@ -292,7 +288,7 @@ func (s *Store) AssociateMessage(ctx context.Context, id int64, remoteID, audit 
 // marker. A duplicate external message is possible and documented.
 func (s *Store) Resend(ctx context.Context, id int64, audit string) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
-		d, err := scanDelivery(tx.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d LEFT JOIN conversations c ON c.route_key = d.route_key WHERE d.id = ?`, id))
+		d, err := scanDelivery(tx.QueryRowContext(ctx, `SELECT `+deliveryColumns+` FROM deliveries d WHERE d.id = ?`, id))
 		if err != nil {
 			return err
 		}

@@ -20,6 +20,7 @@ import (
 	"github.com/mattsp1290/eino-channels/internal/config"
 	"github.com/mattsp1290/eino-channels/internal/conversation"
 	"github.com/mattsp1290/eino-channels/internal/discord"
+	"github.com/mattsp1290/eino-channels/internal/redact"
 	"github.com/mattsp1290/eino-channels/internal/slack"
 	"github.com/mattsp1290/eino-channels/internal/state"
 )
@@ -126,7 +127,7 @@ func serve(args []string, stderr io.Writer, getenv func(string) string, logger *
 	defer stop()
 	code, err := Serve(ctx, cfg, secrets, logger)
 	if err != nil {
-		logger.Error("serve failed", "error", safeErr(err))
+		logger.Error("serve failed", "error", redact.Err(err))
 	}
 	return code
 }
@@ -174,31 +175,32 @@ func Serve(ctx context.Context, cfg config.Config, secrets config.Secrets, logge
 	defer adapterCancel()
 
 	fatal := make(chan error, 2)
+	running := 0
 	if slackAdapter != nil {
 		slackAdapter.Attach(svc)
+		running++
 		go func() { fatal <- slackAdapter.Run(adapterCtx) }()
 	}
 	if discordAdapter != nil {
 		discordAdapter.Attach(svc)
+		running++
 		go func() { fatal <- discordAdapter.Run(adapterCtx) }()
 	}
 	logger.Info("eino-channels serving", "version", Version, "slack", cfg.Slack.Enabled, "discord", cfg.Discord.Enabled)
 
+	// One platform failing does not stop the other: serve until the signal
+	// arrives or every adapter has stopped.
 	var exitErr error
-	select {
-	case <-ctx.Done():
-	case err := <-fatal:
-		if err != nil {
-			exitErr = err
-			logger.Error("adapter stopped", "error", safeErr(err))
-			// One platform failing does not stop the other unless it is the only one.
-			if len(deliverers) > 1 {
-				select {
-				case <-ctx.Done():
-				case err2 := <-fatal:
-					if err2 != nil {
-						logger.Error("adapter stopped", "error", safeErr(err2))
-					}
+	for stopped := false; !stopped && running > 0; {
+		select {
+		case <-ctx.Done():
+			stopped = true
+		case err := <-fatal:
+			running--
+			if err != nil {
+				logger.Error("adapter stopped", "error", redact.Err(err))
+				if exitErr == nil {
+					exitErr = err
 				}
 			}
 		}
@@ -208,7 +210,7 @@ func Serve(ctx context.Context, cfg config.Config, secrets config.Secrets, logge
 	defer shutdownCancel()
 	code := 0
 	if err := svc.Shutdown(shutdownCtx); err != nil {
-		logger.Error("shutdown incomplete; recovery records retained", "error", safeErr(err))
+		logger.Error("shutdown incomplete; recovery records retained", "error", redact.Err(err))
 		code = 3
 	}
 	svcCancel()
@@ -223,7 +225,7 @@ func Serve(ctx context.Context, cfg config.Config, secrets config.Secrets, logge
 		if err == nil {
 			break
 		}
-		logger.Warn("watch close", "attempt", attempt+1, "error", safeErr(err))
+		logger.Warn("watch close", "attempt", attempt+1, "error", redact.Err(err))
 	}
 	if exitErr != nil && code == 0 {
 		code = 1

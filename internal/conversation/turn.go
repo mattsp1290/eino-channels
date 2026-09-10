@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
-	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/runtime"
@@ -15,6 +13,7 @@ import (
 
 	"github.com/mattsp1290/eino-channels/internal/agentbridge"
 	"github.com/mattsp1290/eino-channels/internal/config"
+	"github.com/mattsp1290/eino-channels/internal/redact"
 	"github.com/mattsp1290/eino-channels/internal/state"
 )
 
@@ -50,7 +49,7 @@ func (s *Service) runPrompt(conv *state.Conversation, item state.Item) workOutco
 	if item.Generation != conv.Generation {
 		// Accepted before a rotation could only happen through a bug; never run it.
 		if err := s.st.Transition(s.ctx, item.ID, "", state.StateCanceled, state.CodeCanceled); err != nil {
-			s.log.Error("cancel stale-generation item", "inbox", item.ID, "error", safeErr(err))
+			s.log.Error("cancel stale-generation item", "inbox", item.ID, "error", redact.Err(err))
 			return workPark
 		}
 		return workDone
@@ -66,23 +65,23 @@ func (s *Service) runPrompt(conv *state.Conversation, item state.Item) workOutco
 	case state.StateQueued:
 		ok, err := s.bridge.HistoryWithinLimits(s.ctx, sessionID)
 		if err != nil {
-			s.log.Warn("history check failed", "error", safeErr(err))
+			s.log.Warn("history check failed", "error", redact.Err(err))
 			return workPark
 		}
 		if !ok {
 			_ = s.st.Transition(s.ctx, item.ID, state.StateQueued, state.StateRejected, state.CodeHistoryLimit)
-			s.Notify(dest, NoticeHistoryLimit)
+			s.Notify(conv.Route, NoticeHistoryLimit)
 			return workDone
 		}
 		if err := s.st.Transition(s.ctx, item.ID, state.StateQueued, state.StateAdmitting, ""); err != nil {
-			s.log.Warn("admitting transition failed", "error", safeErr(err))
+			s.log.Warn("admitting transition failed", "error", redact.Err(err))
 			return workPark
 		}
 		item.State = state.StateAdmitting
 		fallthrough
 	case state.StateAdmitting:
 		var outcome workOutcome
-		receipt, handle, cancelRun, outcome = s.admit(*conv, item, dest)
+		receipt, handle, cancelRun, outcome = s.admit(*conv, item)
 		if outcome != workDone {
 			return outcome
 		}
@@ -138,20 +137,20 @@ func (s *Service) runPrompt(conv *state.Conversation, item state.Item) workOutco
 	// ok (finalized) matters only for completed runs; an interrupted run's
 	// placeholder is never finalized, so its committed text is empty.
 	text, ok, unavailable := s.committedText(sessionID, receipt.RunID)
-	final, code := composeFinal(result, text, ok, unavailable, proj.limitHit(), userStop, proj.liveText())
+	final, code := composeFinal(outcome{Result: result, Committed: text, Finalized: ok, Unavailable: unavailable, LimitHit: proj.limitHit(), UserStop: userStop, Live: proj.liveText()})
 	plans := make([]state.DeliveryPlan, 0, 4)
 	for i, chunk := range deliverer.Chunks(final) {
 		plans = append(plans, state.DeliveryPlan{ChunkIndex: i, Text: chunk, Revision: finalRevision})
 	}
 	if err := s.st.MarkTerminal(s.ctx, item.ID, string(result.Status), code, plans); err != nil {
-		s.log.Error("mark terminal failed", "error", safeErr(err))
+		s.log.Error("mark terminal failed", "error", redact.Err(err))
 		return workPark
 	}
 	return workDone
 }
 
 // admit performs the keyed Start with authoritative recovery on failure.
-func (s *Service) admit(conv state.Conversation, item state.Item, dest state.Destination) (session.AdmissionReceipt, runtime.Handle, context.CancelFunc, workOutcome) {
+func (s *Service) admit(conv state.Conversation, item state.Item) (session.AdmissionReceipt, runtime.Handle, context.CancelFunc, workOutcome) {
 	sessionID := session.ID(conv.RuntimeSessionID)
 	noop := context.CancelFunc(func() {})
 	for {
@@ -165,7 +164,7 @@ func (s *Service) admit(conv state.Conversation, item state.Item, dest state.Des
 			}
 			return rec.Receipt, nil, noop, workDone
 		case !isNotFound(err):
-			s.log.Warn("admission lookup unresolved", "error", safeErr(err))
+			s.log.Warn("admission lookup unresolved", "error", redact.Err(err))
 			return session.AdmissionReceipt{}, nil, noop, workPark
 		}
 		attempts, err := s.st.IncrementAttempts(s.ctx, item.ID)
@@ -174,7 +173,7 @@ func (s *Service) admit(conv state.Conversation, item state.Item, dest state.Des
 		}
 		if attempts > maxAdmissionAttempts {
 			_ = s.st.Transition(s.ctx, item.ID, state.StateAdmitting, state.StateRejected, state.CodeUnavailable)
-			s.Notify(dest, NoticeUnavailable)
+			s.Notify(conv.Route, NoticeUnavailable)
 			return session.AdmissionReceipt{}, nil, noop, workDone
 		}
 		runCtx, cancel := context.WithTimeout(context.WithoutCancel(s.ctx), s.turnTimeout())
@@ -185,14 +184,14 @@ func (s *Service) admit(conv state.Conversation, item state.Item, dest state.Des
 			case errors.Is(err, session.ErrAdmissionConflict):
 				s.log.Error("admission fingerprint conflict; operator diagnostic: frozen payload differs from the committed receipt", "inbox", item.ID)
 				_ = s.st.Transition(s.ctx, item.ID, state.StateAdmitting, state.StateRejected, state.CodeConflict)
-				s.Notify(dest, NoticeConflict)
+				s.Notify(conv.Route, NoticeConflict)
 				return session.AdmissionReceipt{}, nil, noop, workDone
 			case errors.Is(err, session.ErrAdmissionInvalid), errors.Is(err, session.ErrAdmissionUnknown):
 				// Unknown covers a receipt written by a different fingerprint
 				// version: retrying cannot succeed, so reject with the same
 				// safe notice as a conflict.
 				_ = s.st.Transition(s.ctx, item.ID, state.StateAdmitting, state.StateRejected, state.CodeConflict)
-				s.Notify(dest, NoticeConflict)
+				s.Notify(conv.Route, NoticeConflict)
 				return session.AdmissionReceipt{}, nil, noop, workDone
 			case errors.Is(err, session.ErrSessionBusy):
 				// Another run owns the session (an abandoned lease). Let it settle.
@@ -204,7 +203,7 @@ func (s *Service) admit(conv state.Conversation, item state.Item, dest state.Des
 				}
 				continue
 			}
-			s.log.Warn("admission attempt failed", "error", safeErr(err))
+			s.log.Warn("admission attempt failed", "error", redact.Err(err))
 			// Back off before the authoritative lookup and retry.
 			select {
 			case <-time.After(time.Duration(attempts) * time.Second):
@@ -214,7 +213,7 @@ func (s *Service) admit(conv state.Conversation, item state.Item, dest state.Des
 			continue
 		}
 		if err := s.st.MarkAdmitted(s.ctx, item.ID, string(res.Receipt.RunID), string(res.Receipt.UserMessageID), string(res.Receipt.AssistantMessageID)); err != nil {
-			s.log.Error("receipt persistence failed after admission", "error", safeErr(err))
+			s.log.Error("receipt persistence failed after admission", "error", redact.Err(err))
 			// The run may be executing; recovery will find the receipt by key.
 			// Wait for it to settle, but never past shutdown.
 			if res.Handle != nil {
@@ -245,7 +244,7 @@ func (s *Service) recoverHandle(runID session.RunID) (runtime.Handle, workOutcom
 	for {
 		run, err := s.bridge.Run(s.ctx, runID)
 		if err != nil {
-			s.log.Warn("run lookup failed during recovery", "error", safeErr(err))
+			s.log.Warn("run lookup failed during recovery", "error", redact.Err(err))
 			return nil, workPark
 		}
 		if run.Terminal() {
@@ -269,7 +268,7 @@ func (s *Service) recoverHandle(runID session.RunID) (runtime.Handle, workOutcom
 			continue
 		}
 		if err != nil {
-			s.log.Warn("resume failed", "error", safeErr(err))
+			s.log.Warn("resume failed", "error", redact.Err(err))
 			return nil, workPark
 		}
 		return h, workDone
@@ -295,7 +294,7 @@ func (h *staticHandle) Interrupt(context.Context, string) error { return nil }
 func (s *Service) subscribe(sessionID session.ID) *watch.Subscription {
 	sub, err := s.bridge.Watch(s.ctx, sessionID)
 	if err != nil {
-		s.log.Warn("watch unavailable; previews disabled for this turn", "error", safeErr(err))
+		s.log.Warn("watch unavailable; previews disabled for this turn", "error", redact.Err(err))
 		return nil
 	}
 	return sub
@@ -309,23 +308,35 @@ func (s *Service) committedText(sessionID session.ID, runID session.RunID) (text
 		return "", false, true
 	}
 	if err != nil {
-		s.log.Warn("committed read failed", "error", safeErr(err))
+		s.log.Warn("committed read failed", "error", redact.Err(err))
 		return "", false, true
 	}
 	text, ok = agentbridge.AssistantText(snap, runID)
 	return text, ok, false
 }
 
-// composeFinal renders the delivered text from the terminal result and the
-// committed assistant text. A completed answer only ever comes from
-// committed text. An interrupted answer may show the in-process live prefix,
-// explicitly labeled as stopped or interrupted; after a restart no live
-// prefix exists and only the notice is delivered.
-func composeFinal(result runtime.Result, text string, ok, unavailable, limitHit, userStop bool, live string) (string, string) {
-	if unavailable {
+// outcome is everything composeFinal needs to render a terminal turn.
+type outcome struct {
+	Result      runtime.Result
+	Committed   string // committed assistant text, if any
+	Finalized   bool   // the committed message is finalized
+	Unavailable bool   // the committed snapshot could not be read
+	LimitHit    bool   // the streaming output cap cancelled the run
+	UserStop    bool   // a user stop interrupted the run
+	Live        string // last in-process live prefix
+}
+
+// composeFinal renders the delivered text and result code for a terminal
+// turn. A completed answer only ever comes from committed text. An
+// interrupted answer may show the in-process live prefix, explicitly
+// labeled as stopped or interrupted; after a restart no live prefix exists
+// and only the notice is delivered.
+func composeFinal(o outcome) (text, code string) {
+	if o.Unavailable {
 		return TextUnavailable, state.CodeUnavailable
 	}
-	text = strings.TrimSpace(text)
+	text = strings.TrimSpace(o.Committed)
+	result, ok, limitHit, userStop, live := o.Result, o.Finalized, o.LimitHit, o.UserStop, o.Live
 	switch result.Status {
 	case session.RunCompleted:
 		if text == "" || !ok {
@@ -334,7 +345,7 @@ func composeFinal(result runtime.Result, text string, ok, unavailable, limitHit,
 		if len(text) > config.MaxOutputBytes {
 			// The model finished before the streaming cap could cancel it:
 			// only the accepted prefix is delivered, explicitly labeled.
-			return truncateUTF8(text, config.MaxOutputBytes) + TextOutputLimit, state.CodeOutputLimit
+			return redact.TruncateUTF8(text, config.MaxOutputBytes) + TextOutputLimit, state.CodeOutputLimit
 		}
 		return text, state.CodeCompleted
 	case session.RunInterrupted:
@@ -342,7 +353,7 @@ func composeFinal(result runtime.Result, text string, ok, unavailable, limitHit,
 		if partial == "" {
 			partial = strings.TrimSpace(live)
 		}
-		partial = truncateUTF8(partial, config.MaxOutputBytes)
+		partial = redact.TruncateUTF8(partial, config.MaxOutputBytes)
 		switch {
 		case limitHit:
 			return partial + TextOutputLimit, state.CodeOutputLimit
@@ -358,18 +369,6 @@ func composeFinal(result runtime.Result, text string, ok, unavailable, limitHit,
 	return TextFailed, state.CodeFailed
 }
 
-// truncateUTF8 cuts s to at most n bytes on a rune boundary.
-func truncateUTF8(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	cut := n
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut]
-}
-
 // safeRunError reduces a run error to a classification code for logs.
 func safeRunError(err error) string {
 	if err == nil {
@@ -383,240 +382,4 @@ func safeRunError(err error) string {
 		return "canceled"
 	}
 	return "provider_error"
-}
-
-// projection consumes watch updates for one run, coalesces previews and
-// enforces the output cap. It owns the single Done consumer.
-type projection struct {
-	s         *Service
-	conv      state.Conversation
-	item      state.Item
-	deliverer Deliverer
-	sub       *watch.Subscription
-	handle    runtime.Handle
-
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
-
-	mu       sync.Mutex
-	live     string
-	lastSeen string // last non-empty observed prefix, kept across LiveUnavailable
-	dirty    bool
-	limit    bool
-	resyncs  int
-	previewR *state.Delivery
-	lastEdit time.Time
-}
-
-func newProjection(s *Service, conv state.Conversation, item state.Item, d Deliverer, sub *watch.Subscription, h runtime.Handle) *projection {
-	p := &projection{s: s, conv: conv, item: item, deliverer: d, sub: sub, handle: h}
-	p.ctx, p.cancel = context.WithCancel(s.ctx)
-	if sub != nil {
-		p.wg.Add(2)
-		go p.consume()
-		go p.flushLoop()
-	}
-	return p
-}
-
-func (p *projection) wait() runtime.Result {
-	select {
-	case r := <-p.handle.Done():
-		return r
-	case <-p.s.ctx.Done():
-		// Shutdown: give the interrupt a bounded chance to settle.
-		select {
-		case r := <-p.handle.Done():
-			return r
-		case <-time.After(5 * time.Second):
-			return runtime.Result{RunID: p.handle.RunID(), Status: session.RunInterrupted}
-		}
-	}
-}
-
-func (p *projection) stop() {
-	p.cancel()
-	p.mu.Lock()
-	sub := p.sub
-	p.mu.Unlock()
-	if sub != nil {
-		sub.Close()
-	}
-	p.wg.Wait()
-	// A resync may have swapped the subscription after the close above.
-	p.mu.Lock()
-	if p.sub != nil && p.sub != sub {
-		p.sub.Close()
-	}
-	p.mu.Unlock()
-}
-
-func (p *projection) limitHit() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.limit
-}
-
-// liveText returns the last observed transient prefix of this run.
-func (p *projection) liveText() string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.lastSeen
-}
-
-func (p *projection) consume() {
-	defer p.wg.Done()
-	runID := p.handle.RunID()
-	for {
-		p.mu.Lock()
-		sub := p.sub
-		p.mu.Unlock()
-		u, err := sub.Next(p.ctx)
-		if err != nil {
-			if p.ctx.Err() != nil {
-				return
-			}
-			// Any subscription death (resync required, a store read timeout,
-			// capacity) costs the live prefix; re-watch a bounded number of
-			// times and say so when giving up.
-			if p.resyncs < maxWatchResyncs {
-				p.resyncs++
-				select {
-				case <-time.After(time.Duration(p.resyncs) * 200 * time.Millisecond):
-				case <-p.ctx.Done():
-					return
-				}
-				fresh, werr := p.s.bridge.Watch(p.ctx, session.ID(p.conv.RuntimeSessionID))
-				if werr == nil {
-					p.mu.Lock()
-					old := p.sub
-					p.sub = fresh
-					p.mu.Unlock()
-					old.Close()
-					continue
-				}
-			}
-			p.s.log.Warn("watch subscription ended; previews unavailable for the rest of this turn", "resync", errors.Is(err, watch.ErrResyncRequired), "error", safeErr(err))
-			return
-		}
-		switch u.Kind {
-		case watch.Live:
-			if u.Live.Identity.RunID != runID {
-				continue
-			}
-			p.setLive(u.Live.Text)
-		case watch.LiveUnavailable:
-			p.setLive("")
-		case watch.Durable:
-			for _, r := range u.Snapshot.Runs {
-				if r.ID == runID && r.Terminal() {
-					return
-				}
-			}
-			if text, ok := agentbridge.AssistantText(u.Snapshot, runID); ok {
-				p.setLive(text)
-			}
-		}
-	}
-}
-
-func (p *projection) setLive(text string) {
-	p.mu.Lock()
-	if len(text) > config.MaxOutputBytes && !p.limit {
-		p.limit = true
-		p.mu.Unlock()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = p.handle.Interrupt(ctx, "output limit")
-		cancel()
-		return
-	}
-	if text != p.live {
-		p.live, p.dirty = text, true
-	}
-	if text != "" {
-		p.lastSeen = text
-	}
-	p.mu.Unlock()
-}
-
-// flushLoop creates the status message once and edits it with coalesced
-// previews at most once per coalescing interval.
-func (p *projection) flushLoop() {
-	defer p.wg.Done()
-	ticker := time.NewTicker(p.s.spacing)
-	defer ticker.Stop()
-	// Create the placeholder only when this run is next in the lane.
-	if !p.ensurePreviewRow() {
-		return
-	}
-	for {
-		select {
-		case <-p.ctx.Done():
-			return
-		case <-ticker.C:
-		}
-		p.mu.Lock()
-		text, dirty := p.live, p.dirty
-		p.dirty = false
-		row := p.previewR
-		p.mu.Unlock()
-		if !dirty || row == nil || row.RemoteID == "" {
-			continue
-		}
-		if err := p.s.throttle(p.ctx, row.Destination); err != nil {
-			return
-		}
-		ctx, cancel := context.WithTimeout(p.ctx, p.s.platformTimeout())
-		err := p.deliverer.Edit(ctx, row.Destination, row.RemoteID, p.deliverer.Preview(text))
-		cancel()
-		if err != nil {
-			var de *DeliveryError
-			if errors.As(err, &de) && de.Kind == KindRateLimited && de.RetryAfter > 0 {
-				select {
-				case <-time.After(min(de.RetryAfter, 30*time.Second)):
-				case <-p.ctx.Done():
-					return
-				}
-			}
-		}
-	}
-}
-
-// ensurePreviewRow plans and creates the chunk-0 status message when the
-// delivery lane is clear up to this run. It returns false when previews
-// must be skipped for this turn.
-func (p *projection) ensurePreviewRow() bool {
-	// The recheck is a precondition of every dispatch, previews included.
-	actx, acancel := context.WithTimeout(p.ctx, p.s.platformTimeout())
-	allowed, aerr := p.deliverer.Allowed(actx, p.conv.Route.Destination())
-	acancel()
-	if aerr != nil || !allowed {
-		return false
-	}
-	row, err := p.s.st.PlanPreview(p.ctx, p.item, p.deliverer.Preview(""))
-	if err != nil {
-		return false
-	}
-	next, blocked, err := p.s.st.NextDelivery(p.ctx, p.conv.Route.Key())
-	if err != nil || blocked || next.ID != row.ID {
-		return false
-	}
-	if row.RemoteID == "" {
-		// A create in flight must not be canceled by run completion: that is
-		// exactly the ambiguous case. Persistence after a create is never canceled.
-		ok, _ := p.s.createDelivery(context.WithoutCancel(p.ctx), p.deliverer, row)
-		if !ok {
-			return false
-		}
-		created, err := p.s.st.GetDelivery(p.ctx, row.ID)
-		if err != nil || created.RemoteID == "" {
-			return false
-		}
-		row = created
-	}
-	p.mu.Lock()
-	p.previewR = &row
-	p.mu.Unlock()
-	return true
 }

@@ -45,7 +45,7 @@ func TestComposeFinalTable(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, code := composeFinal(runtime.Result{Status: c.status, Interrupted: c.interrupted}, c.text, c.ok, c.unavailable, c.limit, c.uStop, c.live)
+			got, code := composeFinal(outcome{Result: runtime.Result{Status: c.status, Interrupted: c.interrupted}, Committed: c.text, Finalized: c.ok, Unavailable: c.unavailable, LimitHit: c.limit, UserStop: c.uStop, Live: c.live})
 			if got != c.want || code != c.code {
 				t.Fatalf("got (%q…, %s) want (%q…, %s)", got[:min(len(got), 40)], code, c.want[:min(len(c.want), 40)], c.code)
 			}
@@ -91,7 +91,7 @@ func TestParkRefusesStaleDecision(t *testing.T) {
 // throttle gives the spacing slot back when the wait is cut short.
 func TestThrottleRollsBackOnCancel(t *testing.T) {
 	s := newBareService()
-	dest := state.Destination{Platform: state.PlatformSlack, Channel: "C1", DMActor: "U1"}
+	dest := state.Destination{Platform: state.PlatformSlack, Channel: "C1"}
 	if err := s.throttle(context.Background(), dest); err != nil {
 		t.Fatal(err)
 	}
@@ -100,12 +100,7 @@ func TestThrottleRollsBackOnCancel(t *testing.T) {
 	if err := s.throttle(ctx, dest); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err=%v", err)
 	}
-	key := dest
-	key.DMActor = ""
-	if s.limiterLast[key].After(time.Now()) {
+	if s.limiterLast[dest].After(time.Now()) {
 		t.Fatal("cancelled wait kept the future slot")
-	}
-	if _, ok := s.limiterLast[dest]; ok {
-		t.Fatal("actor must not be part of the spacing key")
 	}
 }

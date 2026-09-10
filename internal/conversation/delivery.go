@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/mattsp1290/eino-channels/internal/config"
+	"github.com/mattsp1290/eino-channels/internal/redact"
 	"github.com/mattsp1290/eino-channels/internal/state"
 )
 
@@ -15,7 +16,6 @@ const limiterPruneAge = 10 * time.Minute
 // destination. It returns the context error when the wait is cut short so
 // the caller skips the call instead of sending with a dead context.
 func (s *Service) throttle(ctx context.Context, dest state.Destination) error {
-	dest.DMActor = "" // spacing is per address; the actor is not part of it
 	s.limiterMu.Lock()
 	now := time.Now()
 	if len(s.limiterLast) > 1024 {
@@ -63,7 +63,7 @@ func exhausted(row state.Delivery) bool {
 
 func (s *Service) recordf(err error, msg string, id int64) {
 	if err != nil {
-		s.log.Error(msg, "delivery", id, "error", safeErr(err))
+		s.log.Error(msg, "delivery", id, "error", redact.Err(err))
 	}
 }
 
@@ -79,71 +79,104 @@ func (s *Service) persistCreated(id int64, remoteID string, revision int64) erro
 		if err == nil {
 			return nil
 		}
-		time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+		select {
+		case <-time.After(time.Duration(attempt+1) * 200 * time.Millisecond):
+		case <-s.ctx.Done():
+			// One last immediate attempt so a create that landed is recorded.
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err = s.st.MarkCreated(ctx, id, remoteID, revision)
+			cancel()
+			return err
+		}
 	}
 	return err
 }
 
-// createDelivery persists an intent, performs one create, and records the
-// outcome. ok is false when the row cannot proceed now; progressed reports
-// whether durable state changed (the lane loop parks when it did not).
-func (s *Service) createDelivery(ctx context.Context, d Deliverer, row state.Delivery) (ok, progressed bool) {
-	if exhausted(row) {
-		s.recordf(s.st.MarkFailed(ctx, row.ID, "automated attempts exhausted"), "mark failed", row.ID)
-		return false, true
-	}
-	if row.Op == state.OpCreateIntent && row.Status == state.DeliveryPending {
-		// An intent without a recorded outcome: a previous process may have
-		// created the message. Never create again blindly.
-		s.recordf(s.st.MarkAmbiguous(ctx, row.ID), "mark ambiguous", row.ID)
-		s.reconcile(ctx, d, row)
-		return false, true
-	}
-	if !row.HasDesiredText {
-		s.recordf(s.st.MarkEdited(ctx, row.ID, row.DesiredRevision), "acknowledge empty payload", row.ID)
-		return false, true
-	}
-	// Wait for the rate-limit slot before recording the intent: an intent
-	// with no recorded outcome is treated as a possible send.
-	if err := s.throttle(ctx, row.Destination); err != nil {
-		return false, false
-	}
-	intent, err := s.st.MarkCreateIntent(ctx, row.ID)
-	if err != nil {
-		s.recordf(err, "mark create intent", row.ID)
-		return false, false
-	}
-	cctx, cancel := context.WithTimeout(ctx, s.platformTimeout())
-	remoteID, err := d.Create(cctx, intent.Destination, intent.DesiredText, intent.Nonce)
-	cancel()
-	if err == nil {
-		if err := s.persistCreated(intent.ID, remoteID, intent.DesiredRevision); err != nil {
-			s.log.Error("create succeeded but could not be recorded; row left as intent for ambiguity handling", "delivery", intent.ID, "error", safeErr(err))
-			return false, false
-		}
-		return true, true
-	}
+// createOutcome classifies one createDelivery pass.
+type createOutcome int
+
+const (
+	createBlocked   createOutcome = iota // nothing durable changed; park the lane
+	createFailed                         // a failure or ambiguity was recorded
+	createSucceeded                      // the message exists and is recorded
+)
+
+// retryMark records a retry schedule for a row.
+type retryMark func(ctx context.Context, id int64, retryAt time.Time) error
+
+// recordFailure classifies a platform error and records the matching
+// durable state: permanent → failed, rate limited → wait for the server's
+// hint, otherwise → backoff. ambiguous, when non-nil, handles the
+// create-only unknown-outcome case.
+func (s *Service) recordFailure(ctx context.Context, row state.Delivery, err error, attempts int, mark retryMark, ambiguous func()) {
 	var de *DeliveryError
 	if !errors.As(err, &de) {
 		de = &DeliveryError{Kind: KindDefinite, Err: err}
 	}
 	switch de.Kind {
 	case KindAmbiguous:
-		s.recordf(s.st.MarkAmbiguous(ctx, intent.ID), "mark ambiguous", intent.ID)
-		s.reconcile(ctx, d, intent)
+		if ambiguous != nil {
+			ambiguous()
+			return
+		}
+		s.recordf(mark(ctx, row.ID, time.Now().Add(backoff(attempts))), "mark retry", row.ID)
 	case KindPermanent:
-		s.recordf(s.st.MarkFailed(ctx, intent.ID, "permanent platform failure"), "mark failed", intent.ID)
+		s.recordf(s.st.MarkFailed(ctx, row.ID, "permanent platform failure"), "mark failed", row.ID)
 	case KindRateLimited:
 		wait := de.RetryAfter
 		if wait <= 0 {
-			wait = backoff(intent.Attempts)
+			wait = backoff(attempts)
 		}
-		// The intent already counted this attempt.
-		s.recordf(s.st.MarkRetryAt(ctx, intent.ID, time.Now().Add(min(wait, 5*time.Minute))), "mark retry", intent.ID)
+		s.recordf(mark(ctx, row.ID, time.Now().Add(min(wait, 5*time.Minute))), "mark retry", row.ID)
 	default:
-		s.recordf(s.st.MarkRetryAt(ctx, intent.ID, time.Now().Add(backoff(intent.Attempts))), "mark retry", intent.ID)
+		s.recordf(mark(ctx, row.ID, time.Now().Add(backoff(attempts))), "mark retry", row.ID)
 	}
-	return false, true
+}
+
+// createDelivery persists an intent, performs one create, and records the
+// outcome.
+func (s *Service) createDelivery(ctx context.Context, d Deliverer, row state.Delivery) createOutcome {
+	if exhausted(row) {
+		s.recordf(s.st.MarkFailed(ctx, row.ID, "automated attempts exhausted"), "mark failed", row.ID)
+		return createFailed
+	}
+	if row.Op == state.OpCreateIntent && row.Status == state.DeliveryPending {
+		// An intent without a recorded outcome: a previous process may have
+		// created the message. Never create again blindly.
+		s.recordf(s.st.MarkAmbiguous(ctx, row.ID), "mark ambiguous", row.ID)
+		s.reconcile(ctx, d, row)
+		return createFailed
+	}
+	if !row.HasDesiredText {
+		s.recordf(s.st.MarkEdited(ctx, row.ID, row.DesiredRevision), "acknowledge empty payload", row.ID)
+		return createFailed
+	}
+	// Wait for the rate-limit slot before recording the intent: an intent
+	// with no recorded outcome is treated as a possible send.
+	if err := s.throttle(ctx, row.Destination); err != nil {
+		return createBlocked
+	}
+	intent, err := s.st.MarkCreateIntent(ctx, row.ID)
+	if err != nil {
+		s.recordf(err, "mark create intent", row.ID)
+		return createBlocked
+	}
+	cctx, cancel := context.WithTimeout(ctx, s.platformTimeout())
+	remoteID, err := d.Create(cctx, intent.Destination, intent.DesiredText, intent.Nonce)
+	cancel()
+	if err == nil {
+		if err := s.persistCreated(intent.ID, remoteID, intent.DesiredRevision); err != nil {
+			s.log.Error("create succeeded but could not be recorded; row left as intent for ambiguity handling", "delivery", intent.ID, "error", redact.Err(err))
+			return createBlocked
+		}
+		return createSucceeded
+	}
+	// The intent already counted this attempt, so schedule without counting again.
+	s.recordFailure(ctx, intent, err, intent.Attempts, s.st.MarkRetryAt, func() {
+		s.recordf(s.st.MarkAmbiguous(ctx, intent.ID), "mark ambiguous", intent.ID)
+		s.reconcile(ctx, d, intent)
+	})
+	return createFailed
 }
 
 // reconcile tries once to identify an own message for an ambiguous create.
@@ -160,17 +193,19 @@ func (s *Service) reconcile(ctx context.Context, d Deliverer, row state.Delivery
 	s.log.Warn("delivery create ambiguous; operator resolution required", "delivery", row.ID)
 }
 
-// editDelivery applies the latest desired revision to a known remote message.
-func (s *Service) editDelivery(ctx context.Context, d Deliverer, row state.Delivery) (ok, progressed bool) {
+// editDelivery applies the latest desired revision to a known remote
+// message. It reports whether durable state changed.
+func (s *Service) editDelivery(ctx context.Context, d Deliverer, row state.Delivery) (progressed bool) {
 	if exhausted(row) {
 		s.recordf(s.st.MarkFailed(ctx, row.ID, "automated attempts exhausted"), "mark failed", row.ID)
-		return false, true
+		return true
 	}
 	if !row.HasDesiredText {
-		return s.st.MarkEdited(ctx, row.ID, row.DesiredRevision) == nil, true
+		s.recordf(s.st.MarkEdited(ctx, row.ID, row.DesiredRevision), "acknowledge empty payload", row.ID)
+		return true
 	}
 	if err := s.throttle(ctx, row.Destination); err != nil {
-		return false, false
+		return false
 	}
 	ectx, cancel := context.WithTimeout(ctx, s.platformTimeout())
 	err := d.Edit(ectx, row.Destination, row.RemoteID, row.DesiredText)
@@ -178,27 +213,12 @@ func (s *Service) editDelivery(ctx context.Context, d Deliverer, row state.Deliv
 	if err == nil {
 		if err := s.st.MarkEdited(ctx, row.ID, row.DesiredRevision); err != nil {
 			s.recordf(err, "mark edited", row.ID)
-			return false, false
+			return false
 		}
-		return true, true
+		return true
 	}
-	var de *DeliveryError
-	if !errors.As(err, &de) {
-		de = &DeliveryError{Kind: KindDefinite, Err: err}
-	}
-	switch de.Kind {
-	case KindPermanent:
-		s.recordf(s.st.MarkFailed(ctx, row.ID, "permanent platform failure"), "mark failed", row.ID)
-	case KindRateLimited:
-		wait := de.RetryAfter
-		if wait <= 0 {
-			wait = backoff(row.Attempts + 1)
-		}
-		s.recordf(s.st.MarkAttempt(ctx, row.ID, time.Now().Add(min(wait, 5*time.Minute))), "mark attempt", row.ID)
-	default:
-		s.recordf(s.st.MarkAttempt(ctx, row.ID, time.Now().Add(backoff(row.Attempts+1))), "mark attempt", row.ID)
-	}
-	return false, true
+	s.recordFailure(ctx, row, err, row.Attempts+1, s.st.MarkAttempt, nil)
+	return true
 }
 
 // drainDeliveries advances the ordered lane of a route. It returns whether
@@ -227,22 +247,22 @@ func (s *Service) drainDeliveries(conv *state.Conversation) (blocked bool, wait 
 			s.recordf(s.st.MarkFailed(ctx, row.ID, "no adapter for platform"), "mark failed", row.ID)
 			return true, 0
 		}
+		current, err := s.st.GetConversationByKey(ctx, key)
+		if err != nil {
+			return false, parkUnavailable
+		}
+		*conv = current
 		actx, acancel := context.WithTimeout(ctx, s.platformTimeout())
-		allowed, aerr := d.Allowed(actx, row.Destination)
+		allowed, aerr := d.Allowed(actx, row.Destination, current.Route.Subject())
 		acancel()
 		if aerr != nil {
-			s.log.Warn("destination check unavailable; retrying later", "delivery", row.ID, "error", safeErr(aerr))
+			s.log.Warn("destination check unavailable; retrying later", "delivery", row.ID, "error", redact.Err(aerr))
 			return false, parkUnavailable
 		}
 		if !allowed {
 			s.recordf(s.st.MarkFailed(ctx, row.ID, "destination no longer allowed"), "mark failed", row.ID)
 			return true, 0
 		}
-		current, err := s.st.GetConversationByKey(ctx, key)
-		if err != nil {
-			return false, parkUnavailable
-		}
-		*conv = current
 		if row.Generation != current.Generation {
 			s.recordf(s.st.MarkFailed(ctx, row.ID, "conversation generation rotated"), "mark failed", row.ID)
 			return true, 0
@@ -250,11 +270,11 @@ func (s *Service) drainDeliveries(conv *state.Conversation) (blocked bool, wait 
 		if w := time.Until(row.RetryAt); w > 0 {
 			return false, w
 		}
-		var progressed bool
+		progressed := true
 		if row.RemoteID == "" {
-			_, progressed = s.createDelivery(ctx, d, row)
+			progressed = s.createDelivery(ctx, d, row) != createBlocked
 		} else {
-			_, progressed = s.editDelivery(ctx, d, row)
+			progressed = s.editDelivery(ctx, d, row)
 		}
 		if !progressed {
 			return false, parkUnavailable

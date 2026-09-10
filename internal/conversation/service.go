@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +18,7 @@ import (
 
 	"github.com/mattsp1290/eino-channels/internal/agentbridge"
 	"github.com/mattsp1290/eino-channels/internal/config"
+	"github.com/mattsp1290/eino-channels/internal/redact"
 	"github.com/mattsp1290/eino-channels/internal/state"
 )
 
@@ -111,15 +111,36 @@ func (e *DeliveryError) Error() string {
 // Unwrap exposes the cause for logs (never for user-facing text).
 func (e *DeliveryError) Unwrap() error { return e.Err }
 
+// OutcomePolicy says how an adapter classifies a failure whose effect on
+// the platform is unknown: after a create the message may have landed, so
+// the outcome is ambiguous; after any other call it is a definite failure.
+type OutcomePolicy bool
+
+// Outcome policies.
+const (
+	CallOutcome   OutcomePolicy = false
+	CreateOutcome OutcomePolicy = true
+)
+
+// TransportFailure is the classified error for a cancelled or failed
+// transport exchange under the given policy.
+func TransportFailure(platform string, policy OutcomePolicy) error {
+	if policy == CreateOutcome {
+		return &DeliveryError{Kind: KindAmbiguous, Err: errors.New(platform + ": transport failure")}
+	}
+	return &DeliveryError{Kind: KindDefinite, Err: errors.New(platform + ": transport failure")}
+}
+
 // Deliverer is the platform delivery adapter. Destinations are immutable.
 type Deliverer interface {
 	Create(ctx context.Context, dest state.Destination, text, nonce string) (remoteID string, err error)
 	Edit(ctx context.Context, dest state.Destination, remoteID, text string) error
 	// Reconcile tries to identify an own message created with nonce.
 	Reconcile(ctx context.Context, dest state.Destination, nonce string) (remoteID string, found bool, err error)
-	// Allowed rechecks destination authorization before dispatch. A false
+	// Allowed rechecks destination authorization before dispatch: subject
+	// is the DM actor for a private route and "" for a shared one. A false
 	// result is a denial; an error means the check could not be made now.
-	Allowed(ctx context.Context, dest state.Destination) (bool, error)
+	Allowed(ctx context.Context, dest state.Destination, subject string) (bool, error)
 	// Notify sends a transient, best-effort notice.
 	Notify(ctx context.Context, dest state.Destination, text string) error
 	// Chunks renders committed text into platform-safe ordered chunks.
@@ -169,12 +190,11 @@ type Service struct {
 
 	limiterMu   sync.Mutex
 	limiterLast map[state.Destination]time.Time
-	cursor      string
 }
 
 type notice struct {
-	dest state.Destination
-	text string
+	route state.Route
+	text  string
 }
 
 // New builds a service. Start must be called before Ingest is used.
@@ -250,7 +270,7 @@ func (s *Service) Ingest(ctx context.Context, in state.Inbound) (Response, error
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return Response{}, err
 		}
-		s.log.Error("ingest failed", "platform", in.Route.Platform, "error", safeErr(err))
+		s.log.Error("ingest failed", "platform", in.Route.Platform, "error", redact.Err(err))
 		return Response{}, fmt.Errorf("%w", state.ErrStorage)
 	}
 	resp := Response{Outcome: d.Outcome, Item: d.Item}
@@ -342,12 +362,12 @@ func (s *Service) signal() {
 	}
 }
 
-// Notify queues a transient notice; it never blocks ingestion.
-func (s *Service) Notify(dest state.Destination, text string) {
+// Notify queues a transient notice for a route; it never blocks ingestion.
+func (s *Service) Notify(route state.Route, text string) {
 	select {
-	case s.notices <- notice{dest: dest, text: text}:
+	case s.notices <- notice{route: route, text: text}:
 	default:
-		s.log.Warn("notice dropped: queue full", "platform", dest.Platform)
+		s.log.Warn("notice dropped: queue full", "platform", route.Platform)
 	}
 }
 
@@ -358,24 +378,25 @@ func (s *Service) noticeLoop() {
 		case <-s.ctx.Done():
 			return
 		case n := <-s.notices:
-			d, ok := s.deliverers[n.dest.Platform]
+			d, ok := s.deliverers[n.route.Platform]
 			if !ok {
 				continue
 			}
+			dest := n.route.Destination()
 			ctx, cancel := context.WithTimeout(s.ctx, s.platformTimeout())
-			if allowed, err := d.Allowed(ctx, n.dest); err != nil || !allowed {
+			if allowed, err := d.Allowed(ctx, dest, n.route.Subject()); err != nil || !allowed {
 				if err != nil {
-					s.log.Warn("notice dropped: destination check failed", "platform", n.dest.Platform, "error", safeErr(err))
+					s.log.Warn("notice dropped: destination check failed", "platform", dest.Platform, "error", redact.Err(err))
 				}
 				cancel()
 				continue
 			}
-			if err := s.throttle(ctx, n.dest); err != nil {
+			if err := s.throttle(ctx, dest); err != nil {
 				cancel()
 				continue
 			}
-			if err := d.Notify(ctx, n.dest, n.text); err != nil {
-				s.log.Warn("notice failed", "platform", n.dest.Platform, "error", safeErr(err))
+			if err := d.Notify(ctx, dest, n.text); err != nil {
+				s.log.Warn("notice failed", "platform", dest.Platform, "error", redact.Err(err))
 			}
 			cancel()
 		}
@@ -466,24 +487,4 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	}
 	s.loops.Wait()
 	return err
-}
-
-var tokenShapes = regexp.MustCompile(`xox[abp]-[A-Za-z0-9-]+|xapp-[A-Za-z0-9-]+|Bot [A-Za-z0-9._-]{20,}|Bearer [A-Za-z0-9._-]{16,}`)
-
-// safeErr renders an error for logs: known token shapes are redacted and
-// the text is truncated on a rune boundary. It does not make arbitrary
-// error bodies safe; callers still avoid logging provider or platform bodies.
-func safeErr(err error) string {
-	if err == nil {
-		return ""
-	}
-	msg := tokenShapes.ReplaceAllString(err.Error(), "<redacted>")
-	if len(msg) > 200 {
-		cut := 200
-		for cut > 0 && !utf8.RuneStart(msg[cut]) {
-			cut--
-		}
-		msg = msg[:cut]
-	}
-	return msg
 }

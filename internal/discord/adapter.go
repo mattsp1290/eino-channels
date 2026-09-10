@@ -16,12 +16,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/bwmarrin/discordgo"
 
 	"github.com/mattsp1290/eino-channels/internal/config"
 	"github.com/mattsp1290/eino-channels/internal/conversation"
+	"github.com/mattsp1290/eino-channels/internal/redact"
 	"github.com/mattsp1290/eino-channels/internal/render"
 	"github.com/mattsp1290/eino-channels/internal/state"
 )
@@ -150,7 +150,7 @@ func (a *Adapter) Run(ctx context.Context) error {
 		}
 	})
 	if err := a.s.Open(); err != nil {
-		return fmt.Errorf("discord: gateway open failed: %w", errors.New(safeErr(err)))
+		return fmt.Errorf("discord: gateway open failed: %w", errors.New(redact.Err(err)))
 	}
 	select {
 	case <-a.ready:
@@ -171,13 +171,7 @@ func (a *Adapter) Close() error { return a.s.Close() }
 // HandleMessage validates and ingests one message. Exported for tests.
 func (a *Adapter) HandleMessage(ctx context.Context, m *discordgo.Message) {
 	bot := a.BotID()
-	if bot == "" || m == nil || m.Author == nil || m.Author.Bot || m.Author.ID == bot || m.WebhookID != "" || m.EditedTimestamp != nil {
-		return
-	}
-	if m.Type != discordgo.MessageTypeDefault && m.Type != discordgo.MessageTypeReply {
-		return
-	}
-	if !a.users.Contains(m.Author.ID) {
+	if bot == "" || !a.eligible(m, bot) {
 		return
 	}
 	a.mu.Lock()
@@ -187,45 +181,11 @@ func (a *Adapter) HandleMessage(ctx context.Context, m *discordgo.Message) {
 		return
 	}
 	text := strings.TrimSpace(mention.ReplaceAllString(m.Content, ""))
-	route := state.Route{Platform: state.PlatformDiscord, Installation: bot}
-	if m.GuildID == "" {
-		ch, err := a.channel(ctx, m.ChannelID)
-		if err != nil || ch.Type != discordgo.ChannelTypeDM {
-			return
-		}
-		route.Channel, route.DMActor = m.ChannelID, m.Author.ID
-	} else {
-		if !a.guilds.Contains(m.GuildID) || !a.mentioned(m, bot) {
-			return
-		}
-		ch, err := a.channel(ctx, m.ChannelID)
-		if err != nil {
-			return // fail closed when the parent cannot be resolved
-		}
-		switch ch.Type {
-		case discordgo.ChannelTypeGuildPublicThread:
-			if !a.channels.Contains(ch.ParentID) || ch.GuildID != m.GuildID {
-				return
-			}
-			route.Channel, route.ThreadRoot = m.ChannelID, m.GuildID
-		case discordgo.ChannelTypeGuildText:
-			if !a.channels.Contains(m.ChannelID) || ch.GuildID != m.GuildID {
-				return
-			}
-			if text == "" {
-				return
-			}
-			threadID, ok := a.threadFor(ctx, m)
-			if !ok {
-				a.svc.Notify(state.Destination{Platform: state.PlatformDiscord, Installation: bot, Channel: m.ChannelID, ThreadRoot: m.GuildID}, noticeThreadFailure)
-				return
-			}
-			route.Channel, route.ThreadRoot = threadID, m.GuildID
-		default:
-			return
-		}
-	}
 	if text == "" {
+		return // blank or attachment-only
+	}
+	route, ok := a.resolveRoute(ctx, m, bot)
+	if !ok {
 		return
 	}
 	in := state.Inbound{Route: route, MessageID: m.ID, Actor: m.Author.ID, ActorLabel: m.Author.ID, Content: text, FilesNotice: len(m.Attachments) != 0, ReceivedAt: time.Now()}
@@ -233,12 +193,66 @@ func (a *Adapter) HandleMessage(ctx context.Context, m *discordgo.Message) {
 	defer cancel()
 	resp, err := a.svc.Ingest(pctx, in)
 	if err != nil {
-		a.log.Warn("discord: durable ingest failed; prompt dropped (Gateway has no ack)", "error", err.Error())
+		a.log.Warn("discord: durable ingest failed; prompt dropped (Gateway has no ack)", "error", redact.Err(err))
 		return
 	}
 	if resp.Notice != "" {
-		a.svc.Notify(route.Destination(), resp.Notice)
+		a.svc.Notify(route, resp.Notice)
 	}
+}
+
+// eligible applies the sender filters: humans only, allowlisted, ordinary
+// or reply messages, never edits.
+func (a *Adapter) eligible(m *discordgo.Message, bot string) bool {
+	if m == nil || m.Author == nil || m.Author.Bot || m.Author.ID == bot || m.WebhookID != "" || m.EditedTimestamp != nil {
+		return false
+	}
+	if m.Type != discordgo.MessageTypeDefault && m.Type != discordgo.MessageTypeReply {
+		return false
+	}
+	return a.users.Contains(m.Author.ID)
+}
+
+// resolveRoute maps a message to its conversation route: a DM, an allowed
+// public thread, or a new thread created from a root mention in an allowed
+// text channel (the binding is durable before this returns).
+func (a *Adapter) resolveRoute(ctx context.Context, m *discordgo.Message, bot string) (state.Route, bool) {
+	route := state.Route{Platform: state.PlatformDiscord, Installation: bot}
+	if m.GuildID == "" {
+		ch, err := a.channel(ctx, m.ChannelID)
+		if err != nil || ch.Type != discordgo.ChannelTypeDM {
+			return state.Route{}, false
+		}
+		route.Channel, route.DMActor = m.ChannelID, m.Author.ID
+		return route, true
+	}
+	if !a.guilds.Contains(m.GuildID) || !a.mentioned(m, bot) {
+		return state.Route{}, false
+	}
+	ch, err := a.channel(ctx, m.ChannelID)
+	if err != nil || ch.GuildID != m.GuildID {
+		return state.Route{}, false // fail closed when the parent cannot be resolved
+	}
+	switch ch.Type {
+	case discordgo.ChannelTypeGuildPublicThread:
+		if !a.channels.Contains(ch.ParentID) {
+			return state.Route{}, false
+		}
+		route.Channel, route.ThreadRoot = m.ChannelID, m.GuildID
+	case discordgo.ChannelTypeGuildText:
+		if !a.channels.Contains(m.ChannelID) {
+			return state.Route{}, false
+		}
+		threadID, ok := a.threadFor(ctx, m)
+		if !ok {
+			a.svc.Notify(state.Route{Platform: state.PlatformDiscord, Installation: bot, Channel: m.ChannelID, ThreadRoot: m.GuildID}, noticeThreadFailure)
+			return state.Route{}, false
+		}
+		route.Channel, route.ThreadRoot = threadID, m.GuildID
+	default:
+		return state.Route{}, false
+	}
+	return route, true
 }
 
 func (a *Adapter) mentioned(m *discordgo.Message, bot string) bool {
@@ -343,7 +357,7 @@ func (d *Deliverer) Create(ctx context.Context, dest state.Destination, text, no
 			raw, err = d.a.s.RequestWithBucketID("POST", discordgo.EndpointChannelMessages(dest.Channel), body, discordgo.EndpointChannelMessages(dest.Channel), discordgo.WithContext(ctx))
 		}
 		if err != nil {
-			return "", classify(err, true)
+			return "", classifyCreate(err)
 		}
 	}
 	var msg createdMessage
@@ -357,7 +371,7 @@ func (d *Deliverer) Create(ctx context.Context, dest state.Destination, text, no
 func (d *Deliverer) Edit(ctx context.Context, dest state.Destination, remoteID, text string) error {
 	_, err := d.a.s.ChannelMessageEditComplex(&discordgo.MessageEdit{Channel: dest.Channel, ID: remoteID, Content: &text, AllowedMentions: &discordgo.MessageAllowedMentions{Parse: []discordgo.AllowedMentionType{}}, Flags: discordgo.MessageFlagsSuppressEmbeds}, discordgo.WithContext(ctx))
 	if err != nil {
-		return classify(err, false)
+		return classifyCall(err)
 	}
 	return nil
 }
@@ -390,7 +404,7 @@ func (d *Deliverer) Reconcile(ctx context.Context, dest state.Destination, nonce
 	}
 	raw, err := d.a.s.RequestWithBucketID("GET", fmt.Sprintf("%s?limit=%d", discordgo.EndpointChannelMessages(dest.Channel), reconcileWindow), nil, discordgo.EndpointChannelMessages(dest.Channel), discordgo.WithContext(ctx))
 	if err != nil {
-		return "", false, classify(err, false)
+		return "", false, classifyCall(err)
 	}
 	var msgs []recentMessage
 	if err := json.Unmarshal(raw, &msgs); err != nil {
@@ -409,7 +423,7 @@ func (d *Deliverer) Reconcile(ctx context.Context, dest state.Destination, nonce
 // parent channel. Transport health is not authorization: REST delivery is
 // independent of the Gateway. A lookup failure is reported as an error so
 // the caller retries later instead of failing the delivery.
-func (d *Deliverer) Allowed(ctx context.Context, dest state.Destination) (bool, error) {
+func (d *Deliverer) Allowed(ctx context.Context, dest state.Destination, subject string) (bool, error) {
 	bot := d.a.BotID()
 	if bot == "" {
 		// Before the Gateway Ready handshake the installation identity is
@@ -419,8 +433,8 @@ func (d *Deliverer) Allowed(ctx context.Context, dest state.Destination) (bool, 
 	if dest.Platform != state.PlatformDiscord || dest.Installation != bot {
 		return false, nil
 	}
-	if dest.DMActor != "" {
-		return d.a.users.Contains(dest.DMActor), nil
+	if subject != "" {
+		return d.a.users.Contains(subject), nil
 	}
 	if !d.a.guilds.Contains(dest.ThreadRoot) {
 		return false, nil
@@ -469,11 +483,15 @@ func isArchivedThread(err error) bool {
 	return errors.As(err, &rest) && rest.Message != nil && rest.Message.Code == 50083
 }
 
-// classify maps SDK errors to delivery errors. DiscordGo returns a plain
-// error (not a RESTError) for HTTP 502 when retries are disabled; a 502 on a
-// create therefore falls through to the ambiguous branch on purpose: a
-// gateway error does not prove the request never reached Discord.
-func classify(err error, create bool) error {
+// classifyCreate classifies a failed create: an unknown outcome is
+// ambiguous. DiscordGo returns a plain error (not a RESTError) for HTTP 502
+// when retries are disabled, so a 502 on a create is ambiguous on purpose.
+func classifyCreate(err error) error { return classify(err, conversation.CreateOutcome) }
+
+// classifyCall classifies any other failed REST call.
+func classifyCall(err error) error { return classify(err, conversation.CallOutcome) }
+
+func classify(err error, policy conversation.OutcomePolicy) error {
 	var rl *discordgo.RateLimitError
 	if errors.As(err, &rl) {
 		return &conversation.DeliveryError{Kind: conversation.KindRateLimited, RetryAfter: rl.RetryAfter, Err: errors.New("discord: rate limited")}
@@ -488,25 +506,5 @@ func classify(err error, create bool) error {
 		}
 		return &conversation.DeliveryError{Kind: conversation.KindDefinite, Err: fmt.Errorf("discord: http %d", rest.Response.StatusCode)}
 	}
-	if create {
-		// Cancellation or a transport failure after a create was sent does
-		// not prove the server never processed it.
-		return &conversation.DeliveryError{Kind: conversation.KindAmbiguous, Err: errors.New("discord: transport failure")}
-	}
-	return &conversation.DeliveryError{Kind: conversation.KindDefinite, Err: errors.New("discord: transport failure")}
-}
-
-func safeErr(err error) string {
-	if err == nil {
-		return ""
-	}
-	s := err.Error()
-	if len(s) > 120 {
-		cut := 120
-		for cut > 0 && !utf8.RuneStart(s[cut]) {
-			cut--
-		}
-		s = s[:cut]
-	}
-	return s
+	return conversation.TransportFailure("discord", policy)
 }

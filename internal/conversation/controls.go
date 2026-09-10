@@ -52,7 +52,7 @@ func (s *Service) settleStop(conv state.Conversation, ctl state.Item) workOutcom
 	err := s.st.Transition(s.ctx, ctl.ID, state.StatePending, state.StateComplete, "")
 	switch {
 	case err == nil:
-		s.Notify(conv.Route.Destination(), NoticeStopped)
+		s.Notify(conv.Route, NoticeStopped)
 	case errors.Is(err, state.ErrConflict):
 		// Already completed by an earlier replay: no second notice.
 	default:

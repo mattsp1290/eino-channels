@@ -12,8 +12,8 @@ prompt or answer bodies, raw errors or screenshots.
 | slack-go/slack | v0.29.0 |
 | bwmarrin/discordgo | v0.29.0 |
 | Model / protocol | deepseek-v4-flash / Chat Completions via OpenCode Go |
-| OS / Go | (fill in) |
-| Date | (fill in) |
+| OS / Go | macOS 26.6.2 / go1.26.8 (darwin/arm64) |
+| Date | 2026-09-10 |
 
 Prerequisites: operator-managed test bot installations, an eligible OpenCode
 Go key, disposable DM/channel/thread locations and nonsensical prompts. Get
@@ -21,18 +21,29 @@ explicit authorization before sending live bot messages to other people.
 
 | Case | Slack | Discord |
 | --- | --- | --- |
-| Short answer with a nonce | not run | not run |
-| Follow-up referring to the nonce | not run | not run |
-| Restart, then a reference question | not run | not run |
-| Preview edit visible during a long answer | not run | not run |
-| `!stop` then continue | not run | not run |
-| Long Unicode / code-fence answer, chunk order | not run | not run |
-| Thread vs DM isolation | not run | not run |
-| `!help`, `!new`, denied actor | not run | not run |
-| One platform disconnected, other continues | not run | not run |
-| Effective permissions/intents, no mention notifications | not run | not run |
-| Flash accepts no-tools multi-turn history across restart | not run | not run |
+| Short answer with a nonce | not run | pass |
+| Follow-up referring to the nonce | not run | pass |
+| Restart, then a reference question | not run | pass |
+| Preview edit visible during a long answer | not run | pass |
+| `!stop` then continue | not run | pass |
+| Long Unicode / code-fence answer, chunk order | not run | pass |
+| Thread vs DM isolation | not run | pass |
+| `!help`, `!new`, denied actor | not run | pass (`!help`, `!new`); denied actor not run |
+| One platform disconnected, other continues | not run | not applicable (single platform enabled) |
+| Effective permissions/intents, no mention notifications | not run | pass |
+| Flash accepts no-tools multi-turn history across restart | not run | pass |
 
-Status: live gate not yet executed. Failure of the live eligibility, model or
-protocol gate blocks release and identifies the provider owner; it does not
-authorize a fallback provider or model.
+Status: Discord half executed on 2026-09-10 against one operator-managed
+test installation (DM plus one public thread in one allowed text channel);
+every case passed. Observations: the placeholder edited in place while
+streaming; a 600-word answer with a Python block delivered as three ordered
+chunks within the 1800-unit budget with the fence balanced across the split;
+every bot message carried empty allowed mentions and suppressed embeds;
+restart preserved the DM conversation; `!stop` settled the run interrupted
+with the stopped notice; `!new` rotated the generation and the follow-up ran
+on a fresh session; the service log recorded no warnings. Denied-actor was
+not run (no second participant available). Slack is not run: the test
+workspace app has no app-level (Socket Mode) token, lacks `im:history`, and
+has no `app_mention`/`message.im` event subscriptions yet. Failure of the
+live eligibility, model or protocol gate blocks release and identifies the
+provider owner; it does not authorize a fallback provider or model.
